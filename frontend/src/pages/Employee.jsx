@@ -22,7 +22,7 @@ import {
 } from '../services/api';
 import {
   Plus, Clock, CheckCircle, XCircle, ChevronLeft, ChevronRight, Calendar,
-  CalendarDays, MessageSquare, UserCheck, Mail, MailOpen, AlertCircle, LogOut, Trash2, X
+  CalendarDays, MessageSquare, UserCheck, Mail, MailOpen, AlertCircle, LogOut, Trash2, X, Download
 } from 'lucide-react';
 
 // =============== EMPLOYEE PAGES ===============
@@ -670,6 +670,7 @@ const EmployeeAttendance = () => {
   const [currentMonth, setCurrentMonth] = useState(new Date());
   const [loading, setLoading] = useState(true);
   const [stats, setStats] = useState({ present: 0, late: 0, absent: 0 });
+  const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
     loadAttendance();
@@ -698,6 +699,41 @@ const EmployeeAttendance = () => {
       console.error('Failed to load attendance:', error);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleDownloadMonthly = async () => {
+    try {
+      setDownloading(true);
+      const year = currentMonth.getFullYear();
+      const month = currentMonth.getMonth() + 1;
+      
+      const token = localStorage.getItem('token');
+      const response = await fetch(`http://localhost:8000/attendance/export/employee-monthly?year=${year}&month=${month}`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error('Download failed');
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `attendance_${format(currentMonth, 'MMMM_yyyy')}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Download failed:', error);
+      alert('Failed to download report');
+    } finally {
+      setDownloading(false);
     }
   };
 
@@ -755,6 +791,15 @@ const EmployeeAttendance = () => {
                 <ChevronRight className="w-4 h-4" />
               </Button>
             </div>
+            <Button 
+              onClick={handleDownloadMonthly} 
+              disabled={downloading}
+              size="sm"
+              className="flex items-center space-x-2"
+            >
+              <Download className="w-4 h-4" />
+              <span>{downloading ? 'Downloading...' : 'Download Report'}</span>
+            </Button>
           </div>
           {attendance.length === 0 ? (
             <div className="text-center py-12">

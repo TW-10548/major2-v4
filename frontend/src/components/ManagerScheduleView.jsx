@@ -358,17 +358,19 @@ const ManagerScheduleView = ({ user }) => {
                               }`}
                               style={{ minWidth: '140px' }}
                             >
-                              {onLeave && (
-                                <div className="text-center">
-                                  <div className="font-bold text-red-700">LEAVE</div>
-                                </div>
-                              )}
                               {unavail && (
                                 <div className="text-center">
                                   <div className="font-bold text-orange-700">UNAVAIL</div>
                                 </div>
                               )}
-                              {!onLeave && !unavail && shifts.length > 0 && (
+                              {onLeave && (
+                                <div className="mb-2">
+                                  <div className="text-center">
+                                    <div className="font-bold text-red-700">LEAVE</div>
+                                  </div>
+                                </div>
+                              )}
+                              {shifts.length > 0 && (
                                 <div className="space-y-1">
                                   {shifts.map((shift, sIdx) => (
                                     <div

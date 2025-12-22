@@ -69,20 +69,33 @@ const ScheduleManager = ({ departmentId, employees = [], roles = [] }) => {
       const leavesRes = await api.get('/leave-requests');
       if (leavesRes.data) {
         const leavesByKey = {};
+        console.log('All leave requests:', leavesRes.data);
+        
         leavesRes.data.forEach(leave => {
+          console.log(`Processing leave: emp=${leave.employee_id}, status=${leave.status}, start=${leave.start_date}, end=${leave.end_date}`);
+          
           if (leave.status === 'approved') {
+            // Convert start_date and end_date to strings if they're not already
+            let startDateStr = typeof leave.start_date === 'string' ? leave.start_date : new Date(leave.start_date).toISOString().split('T')[0];
+            let endDateStr = typeof leave.end_date === 'string' ? leave.end_date : new Date(leave.end_date).toISOString().split('T')[0];
+            
+            console.log(`  ✓ Approved leave: emp=${leave.employee_id}, ${startDateStr} to ${endDateStr}`);
+            
             // Expand date range
-            const startDate = new Date(leave.start_date + 'T00:00:00');
-            const endDate = new Date(leave.end_date + 'T00:00:00');
+            const startDate = new Date(startDateStr + 'T00:00:00');
+            const endDate = new Date(endDateStr + 'T00:00:00');
 
             for (let currentDate = new Date(startDate);
                  currentDate <= endDate;
                  currentDate.setDate(currentDate.getDate() + 1)) {
               const dateStr = currentDate.toISOString().split('T')[0];
               leavesByKey[`${leave.employee_id}-${dateStr}`] = leave;
+              console.log(`    → Added leave key: ${leave.employee_id}-${dateStr}`);
             }
           }
         });
+        
+        console.log('Final leave map:', leavesByKey);
         setLeaveRequests(leavesByKey);
       }
     } catch (error) {
@@ -103,6 +116,40 @@ const ScheduleManager = ({ departmentId, employees = [], roles = [] }) => {
       console.log('Generating schedules for', startDate, 'to', endDate);
       const response = await generateSchedule(startDate, endDate);
       console.log('Generation response:', response);
+
+      // ===== NEW: Check if confirmation required =====
+      if (response.data?.requires_confirmation) {
+        const shouldRegenerate = window.confirm(
+          response.data.feedback.join('\n') + '\n\nClick OK to regenerate and replace existing schedules.'
+        );
+        
+        if (shouldRegenerate) {
+          // Call again with regenerate=true flag
+          setLoading(true);
+          const regenerateResponse = await generateSchedule(startDate, endDate, true);
+          const scheduleCount = regenerateResponse.data?.schedules_created || 0;
+          const feedback = regenerateResponse.data?.feedback || [];
+
+          if (scheduleCount > 0) {
+            setSuccess(`✅ Regenerated ${scheduleCount} schedules!\n${feedback.join('\n')}`);
+          } else {
+            setError(`⚠️ No schedules generated.\n${feedback.join('\n')}`);
+          }
+        } else {
+          setError('Schedule generation cancelled.');
+        }
+
+        setTimeout(() => {
+          setSuccess('');
+          setError('');
+        }, 5000);
+
+        setShowWeekPicker(false);
+        setCurrentWeekStart(selectedWeek);
+        setTimeout(() => loadSchedulesForWeek(), 500);
+        setLoading(false);
+        return;
+      }
 
       // Show feedback from backend
       const scheduleCount = response.data?.schedules_created || 0;
@@ -208,7 +255,30 @@ const ScheduleManager = ({ departmentId, employees = [], roles = [] }) => {
           shift_id: s.shift_id
         }));
 
-      await Promise.all([...deleteTasks, ...createTasks, ...updateTasks]);
+      const allResults = await Promise.all([...deleteTasks, ...createTasks, ...updateTasks]);
+      
+      // Check if any results have overtime approval pending
+      const overtimeWarnings = allResults.filter(r => r?.status === 'requires_overtime_approval');
+      
+      if (overtimeWarnings.length > 0) {
+        // Show overtime popup
+        const warnings = overtimeWarnings.map(ot => {
+          return `${ot.employee_name} (${ot.date}): ${ot.message}\n` +
+                 `Shift Hours: ${ot.shift_hours}h, Total Daily: ${ot.total_daily_hours}h, Total Weekly: ${ot.total_weekly_hours}h`;
+        }).join('\n\n');
+        
+        const shouldContinue = window.confirm(
+          'Overtime Alert!\n\n' + warnings + 
+          '\n\nOT Available: ' + (overtimeWarnings[0]?.remaining_ot_hours || 0) + 'h' +
+          '\n\nDo you want to proceed with these assignments?'
+        );
+        
+        if (!shouldContinue) {
+          setError('Schedule changes cancelled');
+          setLoading(false);
+          return;
+        }
+      }
 
       setSuccess('✅ Schedule changes saved!');
       setTimeout(() => setSuccess(''), 3000);
@@ -224,7 +294,7 @@ const ScheduleManager = ({ departmentId, employees = [], roles = [] }) => {
         errorMsg = detail.map(e => typeof e === 'string' ? e : e.msg || JSON.stringify(e)).join(', ');
       }
       setError('Failed to save schedule: ' + errorMsg);
-      setTimeout(() => setError(''), 3000);
+      setTimeout(() => setError(''), 5000);
     } finally {
       setLoading(false);
     }
@@ -253,7 +323,12 @@ const ScheduleManager = ({ departmentId, employees = [], roles = [] }) => {
   };
 
   const isOnLeave = (employeeId, date) => {
-    return !!leaveRequests[`${employeeId}-${date}`];
+    const key = `${employeeId}-${date}`;
+    const hasLeave = !!leaveRequests[key];
+    if (hasLeave) {
+      console.log(`✓ Leave found for ${key}`);
+    }
+    return hasLeave;
   };
 
   const weekDates = getWeekDates(currentWeekStart);

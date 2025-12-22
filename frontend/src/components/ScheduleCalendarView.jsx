@@ -96,19 +96,21 @@ const ScheduleCalendarView = ({ schedule, employees, roles, shifts, currentWeek,
                                 }`}
                                 onClick={() => setSelectedEmployee({ ...emp, date, shift })}
                               >
-                                {onLeave && (
-                                  <div className="text-center">
-                                    <div className="font-bold text-red-700">LEAVE</div>
-                                    <div className="text-xs text-red-600">Day Off</div>
-                                  </div>
-                                )}
                                 {unavail && (
                                   <div className="text-center">
                                     <div className="font-bold text-orange-700">UNAVAILABLE</div>
                                     <div className="text-xs text-orange-600">Not Available</div>
                                   </div>
                                 )}
-                                {shift && shiftTime && !onLeave && !unavail && (
+                                {onLeave && (
+                                  <div className="mb-2">
+                                    <div className="text-center">
+                                      <div className="font-bold text-red-700">LEAVE</div>
+                                      <div className="text-xs text-red-600">Day Off</div>
+                                    </div>
+                                  </div>
+                                )}
+                                {shift && shiftTime && (
                                   <div>
                                     <div className="font-bold text-green-700">{shift.name}</div>
                                     <div className="text-xs text-green-600">

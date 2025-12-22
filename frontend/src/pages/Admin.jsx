@@ -23,10 +23,11 @@ import {
   listManagers,
   updateManager,
   reassignManager,
-  deleteManager
+  deleteManager,
+  getAttendance
 } from '../services/api';
 import {
-  Plus, AlertCircle, Users, Building2, UserCog, TrendingUp, Edit2, CheckCircle, Trash2
+  Plus, AlertCircle, Users, Building2, UserCog, TrendingUp, Edit2, CheckCircle, Trash2, XCircle, Clock
 } from 'lucide-react';
 
 // =============== ADMIN PAGES ===============
@@ -961,6 +962,7 @@ const AdminDepartments = () => {
   const [departments, setDepartments] = useState([]);
   const [selectedDept, setSelectedDept] = useState(null);
   const [deptDetails, setDeptDetails] = useState(null);
+  const [attendance, setAttendance] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth() + 1);
@@ -968,6 +970,11 @@ const AdminDepartments = () => {
   const [showModal, setShowModal] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [modalError, setModalError] = useState('');
+  const [stats, setStats] = useState({ present: 0, late: 0, absent: 0 });
+  const [employeeIdInput, setEmployeeIdInput] = useState('');
+  const [empDownloadMonth, setEmpDownloadMonth] = useState(new Date().getMonth() + 1);
+  const [empDownloadYear, setEmpDownloadYear] = useState(new Date().getFullYear());
+  const [empDownloading, setEmpDownloading] = useState(false);
   const [formData, setFormData] = useState({
     dept_id: '',
     name: '',
@@ -998,6 +1005,24 @@ const AdminDepartments = () => {
       const response = await api.get(`/departments/${deptId}/details`);
       setDeptDetails(response.data);
       setSelectedDept(deptId);
+      
+      // Load today's attendance for all employees in this department
+      const today = format(new Date(), 'yyyy-MM-dd');
+      const attendanceResponse = await getAttendance(today, today);
+      setAttendance(attendanceResponse.data);
+      
+      // Calculate stats
+      let present = 0, late = 0, absent = 0;
+      attendanceResponse.data.forEach(record => {
+        if (record.in_time) {
+          if (record.status === 'on-time' || record.status === 'onTime') present++;
+          else late++;
+        } else {
+          absent++;
+        }
+      });
+      setStats({ present, late, absent });
+      
       setError('');
     } catch (err) {
       setError('Failed to load department details');
@@ -1075,6 +1100,46 @@ const AdminDepartments = () => {
     } catch (err) {
       setError('Failed to download weekly report');
       console.error(err);
+    }
+  };
+
+  const downloadEmployeeMonthly = async () => {
+    if (!employeeIdInput) {
+      alert('Please enter an Employee ID');
+      return;
+    }
+
+    try {
+      setEmpDownloading(true);
+      const token = localStorage.getItem('token');
+      const response = await fetch(
+        `http://localhost:8000/attendance/export/employee-monthly?year=${empDownloadYear}&month=${empDownloadMonth}&employee_id=${employeeIdInput}`,
+        {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error('Download failed');
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `employee_${employeeIdInput}_attendance_${empDownloadYear}-${String(empDownloadMonth).padStart(2, '0')}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Download failed:', error);
+      alert('Failed to download employee report');
+    } finally {
+      setEmpDownloading(false);
     }
   };
 
@@ -1313,49 +1378,185 @@ const AdminDepartments = () => {
                     </div>
                   </div>
 
-                  {deptDetails.employees.length > 0 ? (
-                    <div className="overflow-x-auto">
-                      <table className="w-full">
-                        <thead>
-                          <tr className="bg-gray-100 border-b border-gray-300">
-                            {employeeColumns.map((col) => (
-                              <th
-                                key={col.key}
-                                className="px-6 py-3 text-left text-sm font-semibold text-gray-900"
-                                style={{ width: col.width }}
-                              >
-                                {col.label}
-                              </th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {deptDetails.employees.map((emp, idx) => (
-                            <tr
-                              key={emp.id}
-                              className={`border-b border-gray-200 hover:bg-gray-50 transition ${
-                                idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'
-                              }`}
-                            >
-                              {employeeColumns.map((col) => (
-                                <td
-                                  key={col.key}
-                                  className="px-6 py-4 text-sm text-gray-700"
-                                  style={{ width: col.width }}
-                                >
-                                  {col.render ? col.render(emp) : emp[col.key]}
-                                </td>
-                              ))}
-                            </tr>
+                  {/* Employee Monthly Report Download Section */}
+                  <div className="bg-blue-50 p-4 rounded-lg mb-6 border border-blue-200">
+                    <h3 className="text-sm font-semibold text-gray-800 mb-3">📄 Download Individual Employee Monthly Report</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Employee ID</label>
+                        <input
+                          type="text"
+                          placeholder="e.g., EMP001"
+                          value={employeeIdInput}
+                          onChange={(e) => setEmployeeIdInput(e.target.value)}
+                          className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Month</label>
+                        <select
+                          value={empDownloadMonth}
+                          onChange={(e) => setEmpDownloadMonth(parseInt(e.target.value))}
+                          className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                          {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
+                            <option key={m} value={m}>
+                              {new Date(2024, m - 1).toLocaleString('default', { month: 'long' })}
+                            </option>
                           ))}
-                        </tbody>
-                      </table>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Year</label>
+                        <select
+                          value={empDownloadYear}
+                          onChange={(e) => setEmpDownloadYear(parseInt(e.target.value))}
+                          className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                          {Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - 2 + i).map((y) => (
+                            <option key={y} value={y}>{y}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="flex items-end">
+                        <button
+                          onClick={downloadEmployeeMonthly}
+                          disabled={empDownloading}
+                          className="w-full px-4 py-2 bg-purple-500 hover:bg-purple-600 disabled:bg-gray-400 text-white rounded-lg font-medium transition"
+                        >
+                          {empDownloading ? '⏳ Downloading...' : '📥 Download'}
+                        </button>
+                      </div>
                     </div>
-                  ) : (
-                    <div className="text-center py-8">
-                      <p className="text-gray-500">No employees in this department</p>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                    <Card padding={false}>
+                      <div className="p-6">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <p className="text-sm text-gray-500 mb-1">Present</p>
+                            <p className="text-3xl font-bold text-green-600">{stats.present}</p>
+                          </div>
+                          <CheckCircle className="w-8 h-8 text-green-600" />
+                        </div>
+                      </div>
+                    </Card>
+                    <Card padding={false}>
+                      <div className="p-6">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <p className="text-sm text-gray-500 mb-1">Late</p>
+                            <p className="text-3xl font-bold text-yellow-600">{stats.late}</p>
+                          </div>
+                          <AlertCircle className="w-8 h-8 text-yellow-600" />
+                        </div>
+                      </div>
+                    </Card>
+                    <Card padding={false}>
+                      <div className="p-6">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <p className="text-sm text-gray-500 mb-1">Absent</p>
+                            <p className="text-3xl font-bold text-red-600">{stats.absent}</p>
+                          </div>
+                          <XCircle className="w-8 h-8 text-red-600" />
+                        </div>
+                      </div>
+                    </Card>
+                  </div>
+
+                  {/* Attendance Table */}
+                  <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+                    <div className="px-6 py-4 border-b border-gray-200">
+                      <h3 className="text-lg font-semibold text-gray-900">
+                        Today's Attendance - {format(new Date(), 'MMMM dd, yyyy')}
+                      </h3>
                     </div>
-                  )}
+                    
+                    {attendance.length === 0 ? (
+                      <div className="text-center py-12">
+                        <Clock className="w-16 h-16 mx-auto text-gray-400 mb-4" />
+                        <p className="text-gray-500">No scheduled shifts for today</p>
+                      </div>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="min-w-full divide-y divide-gray-200">
+                          <thead className="bg-gray-50">
+                            <tr>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Employee</th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Role</th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Assigned Shift</th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Total Hrs Assigned</th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Check-In</th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Check-Out</th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Total Hrs Worked</th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Break Time</th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Overtime Hours</th>
+                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody className="bg-white divide-y divide-gray-200">
+                            {attendance.map((record) => {
+                              const calculateTotalAssignedHours = () => {
+                                if (!record.schedule?.start_time || !record.schedule?.end_time) return '-';
+                                const [startH, startM] = record.schedule.start_time.split(':').map(Number);
+                                const [endH, endM] = record.schedule.end_time.split(':').map(Number);
+                                const start = startH + startM / 60;
+                                const end = endH + endM / 60;
+                                const hours = end > start ? end - start : 24 - start + end;
+                                return hours.toFixed(2);
+                              };
+
+                              return (
+                                <tr key={record.id} className="hover:bg-gray-50">
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                                    {record.employee?.first_name} {record.employee?.last_name}
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                    {record.schedule?.role?.name || 'N/A'}
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                    {record.schedule ? `${record.schedule.start_time} - ${record.schedule.end_time}` : '-'}
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-blue-600">
+                                    {calculateTotalAssignedHours()} hrs
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                    {record.in_time ? record.in_time : '-'}
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                    {record.out_time ? record.out_time : '-'}
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-green-600">
+                                    {record.worked_hours !== null && record.worked_hours !== undefined ? record.worked_hours.toFixed(2) : '-'} hrs
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                    {record.break_minutes} min
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-orange-600">
+                                    {record.overtime_hours ? record.overtime_hours.toFixed(2) : '-'} hrs
+                                  </td>
+                                  <td className="px-6 py-4 whitespace-nowrap">
+                                    <span className={`px-2 py-1 rounded-full text-xs ${
+                                      record.status === 'onTime' ? 'bg-green-100 text-green-800' :
+                                      record.status === 'slightlyLate' ? 'bg-yellow-100 text-yellow-800' :
+                                      record.status === 'late' ? 'bg-orange-100 text-orange-800' :
+                                      'bg-blue-100 text-blue-800'
+                                    }`}>
+                                      {record.status || 'Scheduled'}
+                                    </span>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
                 </Card>
               </>
             )}

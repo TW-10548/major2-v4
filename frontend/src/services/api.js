@@ -160,10 +160,11 @@ export const getSchedules = (startDate, endDate) => {
 export const createSchedule = (scheduleData) => api.post('/schedules', scheduleData);
 export const updateSchedule = (id, scheduleData) => api.put(`/schedules/${id}`, scheduleData);
 export const deleteSchedule = (id) => api.delete(`/schedules/${id}`);
-export const generateSchedule = (startDate, endDate) => {
+export const generateSchedule = (startDate, endDate, regenerate = false) => {
   const params = new URLSearchParams();
   params.append('start_date', startDate);
   params.append('end_date', endDate);
+  params.append('regenerate', regenerate);
   return api.post(`/schedules/generate?${params.toString()}`);
 };
 

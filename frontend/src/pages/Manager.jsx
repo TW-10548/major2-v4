@@ -1682,6 +1682,10 @@ const ManagerAttendance = ({ user }) => {
   const [stats, setStats] = useState({ present: 0, late: 0, absent: 0 });
   const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth() + 1);
   const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
+  const [employeeIdInput, setEmployeeIdInput] = useState('');
+  const [empDownloadMonth, setEmpDownloadMonth] = useState(new Date().getMonth() + 1);
+  const [empDownloadYear, setEmpDownloadYear] = useState(new Date().getFullYear());
+  const [empDownloading, setEmpDownloading] = useState(false);
 
   useEffect(() => {
     loadAttendance();
@@ -1696,8 +1700,8 @@ const ManagerAttendance = ({ user }) => {
       // Calculate real statistics from attendance data
       let present = 0, late = 0, absent = 0;
       response.data.forEach(record => {
-        if (record.check_in_time) {
-          if (record.check_in_status === 'on-time') present++;
+        if (record.in_time) {
+          if (record.status === 'onTime') present++;
           else late++;
         } else {
           absent++;
@@ -1750,6 +1754,46 @@ const ManagerAttendance = ({ user }) => {
       link.remove();
     } catch (err) {
       console.error('Failed to download weekly report', err);
+    }
+  };
+
+  const downloadEmployeeMonthly = async () => {
+    if (!employeeIdInput) {
+      alert('Please enter an Employee ID');
+      return;
+    }
+
+    try {
+      setEmpDownloading(true);
+      const token = localStorage.getItem('token');
+      const response = await fetch(
+        `http://localhost:8000/attendance/export/employee-monthly?year=${empDownloadYear}&month=${empDownloadMonth}&employee_id=${employeeIdInput}`,
+        {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error('Download failed');
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `employee_${employeeIdInput}_attendance_${empDownloadYear}-${String(empDownloadMonth).padStart(2, '0')}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Download failed:', error);
+      alert('Failed to download employee report');
+    } finally {
+      setEmpDownloading(false);
     }
   };
 
@@ -1846,6 +1890,61 @@ const ManagerAttendance = ({ user }) => {
             </div>
           </div>
 
+          {/* Employee Monthly Report Download Section */}
+          <div className="bg-blue-50 p-4 rounded-lg mb-6 border border-blue-200">
+            <h3 className="text-sm font-semibold text-gray-800 mb-3">📄 Download Individual Employee Monthly Report</h3>
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Employee ID</label>
+                <input
+                  type="text"
+                  placeholder="e.g., EMP001"
+                  value={employeeIdInput}
+                  onChange={(e) => setEmployeeIdInput(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Month</label>
+                <select
+                  value={empDownloadMonth}
+                  onChange={(e) => setEmpDownloadMonth(parseInt(e.target.value))}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
+                    <option key={m} value={m}>
+                      {new Date(2024, m - 1).toLocaleString('default', { month: 'long' })}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Year</label>
+                <select
+                  value={empDownloadYear}
+                  onChange={(e) => setEmpDownloadYear(parseInt(e.target.value))}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  {Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - 2 + i).map((y) => (
+                    <option key={y} value={y}>{y}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex items-end">
+                <button
+                  onClick={downloadEmployeeMonthly}
+                  disabled={empDownloading}
+                  className="w-full px-4 py-2 bg-purple-500 hover:bg-purple-600 disabled:bg-gray-400 text-white rounded-lg font-medium transition"
+                >
+                  {empDownloading ? '⏳ Downloading...' : '📥 Download'}
+                </button>
+              </div>
+            </div>
+          </div>
+
           {attendance.length === 0 ? (
             <div className="text-center py-12">
               <Clock className="w-16 h-16 mx-auto text-gray-400 mb-4" />
@@ -1902,7 +2001,7 @@ const ManagerAttendance = ({ user }) => {
                           {record.out_time ? record.out_time : '-'}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-green-600">
-                          {record.worked_hours ? record.worked_hours.toFixed(2) : '-'} hrs
+                          {record.worked_hours !== null && record.worked_hours !== undefined ? record.worked_hours.toFixed(2) : '-'} hrs
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm">
                           {record.break_minutes} min

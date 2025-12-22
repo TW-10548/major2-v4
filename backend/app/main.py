@@ -8,11 +8,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse, StreamingResponse
 import io
+import calendar
 from calendar import monthrange
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, and_, or_, func, Float
+from sqlalchemy import select, delete, update, and_, or_, func, Float
 from sqlalchemy.orm import selectinload, with_loader_criteria
 from datetime import datetime, timedelta, date
 from typing import List, Dict, Optional
@@ -51,7 +52,7 @@ app.add_middleware(
 )
 
 
-# Exception handler for HTTPException to include CORS headers
+# Custom exception handler for HTTPException to include CORS headers
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     origin = request.headers.get("origin")
@@ -66,8 +67,33 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     if origin in cors_origins or "*" in cors_origins:
         response.headers["Access-Control-Allow-Origin"] = origin or "*"
         response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Accept"
+    
+    return response
+
+
+# Exception handler for generic exceptions
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    print(f"Unhandled exception: {str(exc)}")
+    import traceback
+    traceback.print_exc()
+    
+    origin = request.headers.get("origin")
+    cors_origins = [str(o) for o in settings.CORS_ORIGINS]
+    
+    response = JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {str(exc)}"},
+    )
+    
+    # Add CORS headers
+    if origin in cors_origins or "*" in cors_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin or "*"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Accept"
     
     return response
 
@@ -132,7 +158,27 @@ async def login(
 
 
 @app.get("/users/me", response_model=UserResponse)
-async def read_users_me(current_user: User = Depends(get_current_active_user)):
+async def read_users_me(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # For managers, include their department_id
+    if current_user.user_type == UserType.MANAGER:
+        mgr_result = await db.execute(select(Manager).filter(Manager.user_id == current_user.id))
+        manager = mgr_result.scalar_one_or_none()
+        if manager:
+            # Create a response with manager_department_id
+            response_dict = {
+                "id": current_user.id,
+                "username": current_user.username,
+                "email": current_user.email,
+                "full_name": current_user.full_name,
+                "user_type": current_user.user_type,
+                "is_active": current_user.is_active,
+                "manager_department_id": manager.department_id
+            }
+            return response_dict
+    
     return current_user
 
 
@@ -1082,7 +1128,7 @@ async def check_in(
         employee = result.scalar_one_or_none()
         
         if not employee:
-            raise HTTPException(status_code=400, detail="Employee record not found")
+            raise HTTPException(status_code=400, detail="Employee record not found for this user")
         
         # Check if already checked in
         result = await db.execute(
@@ -1093,7 +1139,7 @@ async def check_in(
             )
         )
         if result.scalar_one_or_none():
-            raise HTTPException(status_code=400, detail="Already checked in")
+            raise HTTPException(status_code=400, detail="Already checked in today. Please check out first.")
         
         # Get today's schedule
         result = await db.execute(
@@ -1105,27 +1151,31 @@ async def check_in(
         schedule = result.scalar_one_or_none()
         
         if not schedule:
-            raise HTTPException(status_code=400, detail="No scheduled shift for today")
+            raise HTTPException(status_code=400, detail="No scheduled shift for today. Please contact your manager.")
         
         # Calculate late status
         now = datetime.now()
+        status_val = "on-time"
+        
         try:
             if isinstance(schedule.start_time, str):
-                scheduled_time = datetime.strptime(schedule.start_time, "%H:%M")
+                scheduled_time = datetime.strptime(schedule.start_time, "%H:%M").time()
             else:
-                scheduled_time = datetime.combine(datetime.today(), schedule.start_time)
+                scheduled_time = schedule.start_time if isinstance(schedule.start_time, type(None)) is False else datetime.strptime("09:00", "%H:%M").time()
             
-            scheduled_datetime = datetime.combine(today, scheduled_time.time())
-            diff_minutes = (now - scheduled_datetime).total_seconds() / 60
-            
-            if diff_minutes <= 0:
-                status_val = "on-time"
-            elif diff_minutes <= 15:
-                status_val = "slightly-late"
-            else:
-                status_val = "late"
-        except (ValueError, TypeError) as e:
+            if scheduled_time:
+                scheduled_datetime = datetime.combine(today, scheduled_time)
+                diff_minutes = (now - scheduled_datetime).total_seconds() / 60
+                
+                if diff_minutes <= 0:
+                    status_val = "on-time"
+                elif diff_minutes <= 15:
+                    status_val = "slightly-late"
+                else:
+                    status_val = "late"
+        except (ValueError, TypeError, AttributeError) as e:
             # If we can't parse the time, just mark as on-time
+            print(f"Time parsing error: {str(e)}")
             status_val = "on-time"
         
         # Create check-in record
@@ -1140,7 +1190,17 @@ async def check_in(
         
         db.add(check_in)
         await db.commit()
-        await db.refresh(check_in, ['employee', 'schedule'])
+        
+        # Refresh with proper eager loading
+        result = await db.execute(
+            select(CheckInOut)
+            .where(CheckInOut.id == check_in.id)
+            .options(
+                selectinload(CheckInOut.employee),
+                selectinload(CheckInOut.schedule).selectinload(Schedule.role)
+            )
+        )
+        check_in = result.scalar_one()
         
         return check_in
     except HTTPException:
@@ -1214,47 +1274,107 @@ async def check_out(
                     status=check_in.check_in_status or "onTime"
                 )
             else:
-                # Update existing attendance record
+                # Update existing attendance record with checkout time
+                attendance.in_time = check_in.check_in_time.strftime("%H:%M") if check_in.check_in_time else None
                 attendance.out_time = check_in.check_out_time.strftime("%H:%M") if check_in.check_out_time else None
+                attendance.schedule_id = check_in.schedule_id  # Ensure schedule_id is set
             
             # Calculate worked hours and overtime
             if check_in.check_in_time and check_in.check_out_time:
                 total_minutes = (check_in.check_out_time - check_in.check_in_time).total_seconds() / 60
                 
-                # Get break minutes from role
+                # Get break minutes from role, but only apply if total time is long enough
                 break_minutes = 0
                 if check_in.schedule and check_in.schedule.role:
-                    break_minutes = check_in.schedule.role.break_minutes or 0
+                    role_break = check_in.schedule.role.break_minutes or 0
+                    # Only apply break if total time is at least the break duration
+                    if total_minutes >= role_break:
+                        break_minutes = role_break
                 
                 worked_minutes = max(0, total_minutes - break_minutes)
-                worked_hours = worked_minutes / 60
+                worked_hours = round(worked_minutes / 60, 2)
                 
-                attendance.worked_hours = round(worked_hours, 2)
+                attendance.worked_hours = worked_hours
                 attendance.break_minutes = break_minutes
                 
-                # Calculate overtime considering approved overtime
-                if check_in.schedule and worked_hours > employee.daily_max_hours:
-                    actual_overtime = worked_hours - employee.daily_max_hours
-                    
-                    # Get approved overtime for this date if exists
-                    approved_ot_result = await db.execute(
-                        select(OvertimeRequest).filter(
-                            OvertimeRequest.employee_id == employee.id,
-                            OvertimeRequest.request_date == today,
-                            OvertimeRequest.status == OvertimeStatus.APPROVED
-                        )
+                # ==================== OVERTIME CALCULATION ====================
+                # Rule: Calculate overtime based on approved overtime window
+                # If 1hr approved OT 18-19 and shift is 9-18:
+                #   - Checkout at 19:00 → 1hr OT
+                #   - Checkout at 19:30 → 1hr OT (capped by approval)
+                #   - Checkout at 18:30 → 0.5hr OT (proportional)
+                
+                attendance.overtime_hours = 0.0
+                
+                # Get approved overtime for this date if exists
+                approved_ot_result = await db.execute(
+                    select(OvertimeRequest).filter(
+                        OvertimeRequest.employee_id == employee.id,
+                        OvertimeRequest.request_date == today,
+                        OvertimeRequest.status == OvertimeStatus.APPROVED
                     )
-                    overtime_request = approved_ot_result.scalar_one_or_none()
-                    
-                    if overtime_request:
-                        # Use minimum of actual overtime and approved overtime
-                        overtime_hours = min(actual_overtime, overtime_request.request_hours)
-                        attendance.overtime_hours = round(overtime_hours, 2)
-                    else:
-                        # No approved overtime, show actual overtime worked
-                        attendance.overtime_hours = round(actual_overtime, 2)
-                else:
-                    attendance.overtime_hours = 0.0
+                )
+                overtime_request = approved_ot_result.scalar_one_or_none()
+                
+                if overtime_request and check_in.schedule:
+                    # Parse shift end time
+                    try:
+                        shift_end_str = check_in.schedule.end_time
+                        if isinstance(shift_end_str, str):
+                            shift_end_h, shift_end_m = map(int, shift_end_str.split(':'))
+                        else:
+                            shift_end_h, shift_end_m = shift_end_str.hour, shift_end_str.minute
+                        
+                        shift_end_time = datetime.combine(today, datetime.min.time().replace(hour=shift_end_h, minute=shift_end_m))
+                        
+                        # Parse approved OT window (from_time to to_time)
+                        ot_start_str = overtime_request.from_time
+                        ot_end_str = overtime_request.to_time
+                        
+                        if ot_start_str and ot_end_str:
+                            ot_start_h, ot_start_m = map(int, ot_start_str.split(':'))
+                            ot_end_h, ot_end_m = map(int, ot_end_str.split(':'))
+                            
+                            ot_window_start = datetime.combine(today, datetime.min.time().replace(hour=ot_start_h, minute=ot_start_m))
+                            ot_window_end = datetime.combine(today, datetime.min.time().replace(hour=ot_end_h, minute=ot_end_m))
+                            
+                            # Calculate how much OT was actually worked
+                            # OT period: from shift end to checkout time, capped by approval window
+                            # Example: Shift ends 18:00, approved OT 18:00-20:00, checkout 19:30
+                            # → OT worked: 18:00-19:30 = 1.5 hours (within 2-hour window)
+                            
+                            ot_period_start = shift_end_time  # When OT begins (shift end)
+                            ot_period_end = check_in.check_out_time  # When employee actually left
+                            
+                            # Cap the actual OT by the approved window
+                            actual_ot_start = max(ot_period_start, ot_window_start)
+                            actual_ot_end = min(ot_period_end, ot_window_end)
+                            
+                            if actual_ot_end > actual_ot_start:
+                                actual_ot_minutes = (actual_ot_end - actual_ot_start).total_seconds() / 60
+                                actual_ot_hours = actual_ot_minutes / 60
+                                
+                                # Cap at approved hours
+                                overtime_hours = min(actual_ot_hours, overtime_request.request_hours)
+                                attendance.overtime_hours = round(overtime_hours, 2)
+                        else:
+                            # No specific time window, use approved hours if worked > 8hrs/day
+                            actual_overtime = worked_hours - employee.daily_max_hours
+                            if actual_overtime > 0:
+                                overtime_hours = min(actual_overtime, overtime_request.request_hours)
+                                attendance.overtime_hours = round(overtime_hours, 2)
+                    except Exception as e:
+                        print(f"Error parsing OT times: {str(e)}")
+                        # Fallback: simple calculation
+                        actual_overtime = worked_hours - employee.daily_max_hours
+                        if actual_overtime > 0:
+                            overtime_hours = min(actual_overtime, overtime_request.request_hours)
+                            attendance.overtime_hours = round(overtime_hours, 2)
+                elif worked_hours > employee.daily_max_hours:
+                    # No approved OT, but worked more than 8hrs - show actual OT
+                    actual_overtime = worked_hours - employee.daily_max_hours
+                    attendance.overtime_hours = round(actual_overtime, 2)
+                # ==================== END OVERTIME CALCULATION ====================
             
             db.add(attendance)
             await db.commit()
@@ -1338,7 +1458,7 @@ async def record_attendance(
 
 
 # Attendance Management
-@app.get("/attendance", response_model=List[AttendanceResponse])
+@app.get("/attendance")
 async def get_attendance(
     start_date: date = None,
     end_date: date = None,
@@ -1353,14 +1473,16 @@ async def get_attendance(
     )
 
     # Role-based filtering
+    target_employee = None
+    manager_dept = None
     if current_user.user_type == UserType.EMPLOYEE:
         # Get employee by user_id
         emp_result = await db.execute(
             select(Employee).filter(Employee.user_id == current_user.id)
         )
-        employee = emp_result.scalar_one_or_none()
-        if employee:
-            query = query.filter(Attendance.employee_id == employee.id)
+        target_employee = emp_result.scalar_one_or_none()
+        if target_employee:
+            query = query.filter(Attendance.employee_id == target_employee.id)
         else:
             return []
     elif current_user.user_type == UserType.MANAGER:
@@ -1382,7 +1504,70 @@ async def get_attendance(
         query = query.filter(Attendance.date <= end_date)
 
     result = await db.execute(query.order_by(Attendance.date.desc()))
-    return result.scalars().all()
+    attendance_records = list(result.scalars().all())
+    
+    # For today, also check for active check-ins (CheckInOut without checkout)
+    today = date.today()
+    if not start_date or start_date <= today:
+        if not end_date or end_date >= today:
+            # Get active check-ins for today
+            if current_user.user_type == UserType.EMPLOYEE and target_employee:
+                checkin_query = select(CheckInOut).filter(
+                    CheckInOut.employee_id == target_employee.id,
+                    CheckInOut.date == today,
+                    CheckInOut.check_out_time == None
+                ).options(
+                    selectinload(CheckInOut.employee),
+                    selectinload(CheckInOut.schedule).selectinload(Schedule.role)
+                )
+            elif current_user.user_type == UserType.MANAGER and manager_dept:
+                subquery = select(Employee.id).filter(Employee.department_id == manager_dept)
+                checkin_query = select(CheckInOut).filter(
+                    CheckInOut.employee_id.in_(subquery),
+                    CheckInOut.date == today,
+                    CheckInOut.check_out_time == None
+                ).options(
+                    selectinload(CheckInOut.employee),
+                    selectinload(CheckInOut.schedule).selectinload(Schedule.role)
+                )
+            else:
+                checkin_query = select(CheckInOut).filter(
+                    CheckInOut.date == today,
+                    CheckInOut.check_out_time == None
+                ).options(
+                    selectinload(CheckInOut.employee),
+                    selectinload(CheckInOut.schedule).selectinload(Schedule.role)
+                )
+            
+            checkin_result = await db.execute(checkin_query)
+            active_checkins = list(checkin_result.scalars().all())
+            
+            # Convert CheckInOut to Attendance-like response for return
+            for checkin in active_checkins:
+                # Check if there's already an Attendance record for this employee today
+                existing = any(r.employee_id == checkin.employee_id and r.date == today for r in attendance_records)
+                if not existing:
+                    # Convert CheckInOut to dict matching AttendanceResponse
+                    att_dict = {
+                        'id': checkin.id,
+                        'employee_id': checkin.employee_id,
+                        'schedule_id': checkin.schedule_id,
+                        'date': checkin.date,
+                        'in_time': checkin.check_in_time.strftime("%H:%M") if checkin.check_in_time else None,
+                        'out_time': None,
+                        'status': checkin.check_in_status or 'onTime',
+                        'out_status': None,
+                        'worked_hours': 0.0,
+                        'overtime_hours': 0.0,
+                        'break_minutes': 0,
+                        'notes': None,
+                        'created_at': checkin.date,
+                        'employee': checkin.employee,
+                        'schedule': checkin.schedule
+                    }
+                    attendance_records.append(att_dict)
+    
+    return attendance_records
 
 
 @app.get("/attendance/today")
@@ -1531,11 +1716,11 @@ async def export_monthly_attendance(
         end_date = date(year, month, monthrange(year, month)[1])
         
         att_result = await db.execute(
-            select(CheckInOut).filter(
-                CheckInOut.employee_id.in_([e.id for e in employees]) if employees else False,
-                CheckInOut.date >= start_date,
-                CheckInOut.date <= end_date
-            ).order_by(CheckInOut.date, CheckInOut.employee_id)
+            select(Attendance).filter(
+                Attendance.employee_id.in_([e.id for e in employees]) if employees else False,
+                Attendance.date >= start_date,
+                Attendance.date <= end_date
+            ).order_by(Attendance.date, Attendance.employee_id)
         )
         attendance_records = att_result.scalars().all()
         
@@ -1563,7 +1748,7 @@ async def export_monthly_attendance(
         ws.merge_cells('A2:J2')
         
         # Headers
-        headers = ['Employee ID', 'Name', 'Date', 'Assigned Shift', 'Total Hrs Assigned', 'Check-In', 'Check-Out', 'Total Hrs Worked', 'Break Time', 'Status']
+        headers = ['Employee ID', 'Name', 'Date', 'Assigned Shift', 'Total Hrs Assigned', 'Check-In', 'Check-Out', 'Total Hrs Worked', 'Break Time', 'Overtime Hours', 'Status']
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=4, column=col)
             cell.value = header
@@ -1604,24 +1789,19 @@ async def export_monthly_attendance(
                         total_hrs_assigned = f"{hours:.2f}"
                     except:
                         pass
-                total_hrs_worked = '-'
-                if record.check_in_time and record.check_out_time:
-                    try:
-                        diff = (record.check_out_time - record.check_in_time).total_seconds() / 3600
-                        total_hrs_worked = f"{diff:.2f}"
-                    except:
-                        pass
+                
                 ws.cell(row=row, column=1).value = employee.employee_id
                 ws.cell(row=row, column=2).value = f"{employee.first_name} {employee.last_name}"
                 ws.cell(row=row, column=3).value = record.date.isoformat()
                 ws.cell(row=row, column=4).value = assigned_shift
                 ws.cell(row=row, column=5).value = total_hrs_assigned
-                ws.cell(row=row, column=6).value = record.check_in_time.strftime('%H:%M:%S') if record.check_in_time else '-'
-                ws.cell(row=row, column=7).value = record.check_out_time.strftime('%H:%M:%S') if record.check_out_time else '-'
-                ws.cell(row=row, column=8).value = total_hrs_worked
-                ws.cell(row=row, column=9).value = '1'
-                ws.cell(row=row, column=10).value = record.check_in_status or '-'
-                for col in range(1, 11):
+                ws.cell(row=row, column=6).value = record.in_time or '-'
+                ws.cell(row=row, column=7).value = record.out_time or '-'
+                ws.cell(row=row, column=8).value = f"{record.worked_hours:.2f}" if record.worked_hours else '-'
+                ws.cell(row=row, column=9).value = f"{record.break_minutes}" if record.break_minutes else '-'
+                ws.cell(row=row, column=10).value = f"{record.overtime_hours:.2f}" if record.overtime_hours else '-'
+                ws.cell(row=row, column=11).value = record.status or '-'
+                for col in range(1, 12):
                     ws.cell(row=row, column=col).border = border
                 row += 1
         
@@ -1635,7 +1815,8 @@ async def export_monthly_attendance(
         ws.column_dimensions['G'].width = 12
         ws.column_dimensions['H'].width = 14
         ws.column_dimensions['I'].width = 12
-        ws.column_dimensions['J'].width = 12
+        ws.column_dimensions['J'].width = 15
+        ws.column_dimensions['K'].width = 12
         
         # Save to bytes
         file_bytes = io.BytesIO()
@@ -1689,11 +1870,11 @@ async def export_weekly_attendance(
         
         # Get attendance for the week
         att_result = await db.execute(
-            select(CheckInOut).filter(
-                CheckInOut.employee_id.in_([e.id for e in employees]) if employees else False,
-                CheckInOut.date >= start_date,
-                CheckInOut.date <= end_date
-            ).order_by(CheckInOut.date, CheckInOut.employee_id)
+            select(Attendance).filter(
+                Attendance.employee_id.in_([e.id for e in employees]) if employees else False,
+                Attendance.date >= start_date,
+                Attendance.date <= end_date
+            ).order_by(Attendance.date, Attendance.employee_id)
         )
         attendance_records = att_result.scalars().all()
         
@@ -1721,7 +1902,7 @@ async def export_weekly_attendance(
         ws.merge_cells('A2:J2')
         
         # Headers
-        headers = ['Employee ID', 'Name', 'Date', 'Assigned Shift', 'Total Hrs Assigned', 'Check-In', 'Check-Out', 'Total Hrs Worked', 'Break Time', 'Status']
+        headers = ['Employee ID', 'Name', 'Date', 'Assigned Shift', 'Total Hrs Assigned', 'Check-In', 'Check-Out', 'Total Hrs Worked', 'Break Time', 'Overtime Hours', 'Status']
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=4, column=col)
             cell.value = header
@@ -1762,24 +1943,19 @@ async def export_weekly_attendance(
                         total_hrs_assigned = f"{hours:.2f}"
                     except:
                         pass
-                total_hrs_worked = '-'
-                if record.check_in_time and record.check_out_time:
-                    try:
-                        diff = (record.check_out_time - record.check_in_time).total_seconds() / 3600
-                        total_hrs_worked = f"{diff:.2f}"
-                    except:
-                        pass
+                
                 ws.cell(row=row, column=1).value = employee.employee_id
                 ws.cell(row=row, column=2).value = f"{employee.first_name} {employee.last_name}"
                 ws.cell(row=row, column=3).value = record.date.isoformat()
                 ws.cell(row=row, column=4).value = assigned_shift
                 ws.cell(row=row, column=5).value = total_hrs_assigned
-                ws.cell(row=row, column=6).value = record.check_in_time.strftime('%H:%M:%S') if record.check_in_time else '-'
-                ws.cell(row=row, column=7).value = record.check_out_time.strftime('%H:%M:%S') if record.check_out_time else '-'
-                ws.cell(row=row, column=8).value = total_hrs_worked
-                ws.cell(row=row, column=9).value = '1'
-                ws.cell(row=row, column=10).value = record.check_in_status or '-'
-                for col in range(1, 11):
+                ws.cell(row=row, column=6).value = record.in_time or '-'
+                ws.cell(row=row, column=7).value = record.out_time or '-'
+                ws.cell(row=row, column=8).value = f"{record.worked_hours:.2f}" if record.worked_hours else '-'
+                ws.cell(row=row, column=9).value = f"{record.break_minutes}" if record.break_minutes else '-'
+                ws.cell(row=row, column=10).value = f"{record.overtime_hours:.2f}" if record.overtime_hours else '-'
+                ws.cell(row=row, column=11).value = record.status or '-'
+                for col in range(1, 12):
                     ws.cell(row=row, column=col).border = border
                 row += 1
         
@@ -1793,7 +1969,8 @@ async def export_weekly_attendance(
         ws.column_dimensions['G'].width = 12
         ws.column_dimensions['H'].width = 14
         ws.column_dimensions['I'].width = 12
-        ws.column_dimensions['J'].width = 12
+        ws.column_dimensions['J'].width = 15
+        ws.column_dimensions['K'].width = 12
         
         # Save to bytes
         file_bytes = io.BytesIO()
@@ -1807,6 +1984,227 @@ async def export_weekly_attendance(
         )
     except Exception as e:
         print(f"Weekly export error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+
+@app.get("/attendance/export/employee-monthly")
+async def export_employee_monthly_attendance(
+    year: int,
+    month: int,
+    employee_id: Optional[str] = None,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Export employee's monthly attendance report with summary stats
+    
+    - If employee_id is provided, only MANAGER and ADMIN can download
+    - If employee_id is not provided, current user gets their own report
+    """
+    try:
+        # Determine which employee to get
+        if employee_id:
+            # Only MANAGER and ADMIN can download other employees' reports
+            if current_user.user_type not in [UserType.MANAGER, UserType.ADMIN]:
+                raise HTTPException(status_code=403, detail="Not authorized to download other employees' reports")
+            
+            # Get the requested employee by employee_id (the ID field, not database id)
+            emp_result = await db.execute(
+                select(Employee).filter(Employee.employee_id == employee_id)
+            )
+            employee = emp_result.scalar_one_or_none()
+            if not employee:
+                raise HTTPException(status_code=404, detail=f"Employee with ID {employee_id} not found")
+            
+            # For MANAGER, check if employee belongs to their department
+            if current_user.user_type == UserType.MANAGER:
+                mgr_result = await db.execute(
+                    select(Manager).filter(Manager.user_id == current_user.id)
+                )
+                manager = mgr_result.scalar_one_or_none()
+                if manager and employee.department_id != manager.department_id:
+                    raise HTTPException(status_code=403, detail="Can only download reports for employees in your department")
+        else:
+            # Get current user's employee record
+            emp_result = await db.execute(
+                select(Employee).filter(Employee.user_id == current_user.id)
+            )
+            employee = emp_result.scalar_one_or_none()
+            if not employee:
+                raise HTTPException(status_code=404, detail="Employee not found")
+        
+        # Get attendance for the month
+        start_date = date(year, month, 1)
+        end_date = date(year, month, monthrange(year, month)[1])
+        
+        att_result = await db.execute(
+            select(Attendance).filter(
+                Attendance.employee_id == employee.id,
+                Attendance.date >= start_date,
+                Attendance.date <= end_date
+            ).order_by(Attendance.date)
+        )
+        attendance_records = att_result.scalars().all()
+        
+        # Get leave records for the month
+        leave_result = await db.execute(
+            select(LeaveRequest).filter(
+                LeaveRequest.employee_id == employee.id,
+                LeaveRequest.start_date <= end_date,
+                LeaveRequest.end_date >= start_date,
+                LeaveRequest.status == LeaveStatus.APPROVED
+            )
+        )
+        leave_records = leave_result.scalars().all()
+        
+        # Get schedules for shift information
+        sched_result = await db.execute(
+            select(Schedule).filter(
+                Schedule.employee_id == employee.id,
+                Schedule.date >= start_date,
+                Schedule.date <= end_date
+            )
+        )
+        schedules = sched_result.scalars().all()
+        schedule_map = {}
+        for sched in schedules:
+            schedule_map[sched.date] = sched
+        
+        # Calculate leave dates
+        leave_dates = set()
+        for leave in leave_records:
+            current = leave.start_date
+            while current <= leave.end_date:
+                leave_dates.add(current)
+                current += timedelta(days=1)
+        
+        # Create workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Monthly Attendance"
+        
+        # Header styles
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        summary_fill = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
+        summary_font = Font(bold=True)
+        
+        # Title
+        ws['A1'] = f"{employee.first_name} {employee.last_name} - Monthly Attendance Report"
+        ws['A1'].font = Font(bold=True, size=14)
+        ws.merge_cells('A1:J1')
+        
+        ws['A2'] = f"{calendar.month_name[month]} {year}"
+        ws.merge_cells('A2:J2')
+        
+        ws['A3'] = f"Employee ID: {employee.employee_id}"
+        
+        # Headers
+        headers = ['Date', 'Day', 'Assigned Shift', 'Check-In', 'Check-Out', 'Hours Worked', 'Break (min)', 'Overtime Hours', 'Status', 'Notes']
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=5, column=col)
+            cell.value = header
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.border = border
+        
+        # Data
+        row = 6
+        total_worked_hours = 0
+        total_ot_hours = 0
+        working_days_count = 0
+        
+        for record in attendance_records:
+            schedule = schedule_map.get(record.date)
+            assigned_shift = '-'
+            if schedule and schedule.start_time and schedule.end_time:
+                assigned_shift = f"{schedule.start_time} - {schedule.end_time}"
+            
+            day_name = record.date.strftime('%A')
+            
+            ws.cell(row=row, column=1).value = record.date.isoformat()
+            ws.cell(row=row, column=2).value = day_name
+            ws.cell(row=row, column=3).value = assigned_shift
+            ws.cell(row=row, column=4).value = record.in_time or '-'
+            ws.cell(row=row, column=5).value = record.out_time or '-'
+            ws.cell(row=row, column=6).value = f"{record.worked_hours:.2f}" if record.worked_hours else '-'
+            ws.cell(row=row, column=7).value = f"{record.break_minutes}" if record.break_minutes else '-'
+            ws.cell(row=row, column=8).value = f"{record.overtime_hours:.2f}" if record.overtime_hours else '-'
+            ws.cell(row=row, column=9).value = record.status or '-'
+            ws.cell(row=row, column=10).value = record.notes or '-'
+            
+            for col in range(1, 11):
+                ws.cell(row=row, column=col).border = border
+            
+            if record.worked_hours and record.worked_hours > 0:
+                total_worked_hours += record.worked_hours
+                working_days_count += 1
+            
+            if record.overtime_hours:
+                total_ot_hours += record.overtime_hours
+            
+            row += 1
+        
+        # Summary section
+        summary_row = row + 2
+        
+        ws.cell(row=summary_row, column=1).value = "SUMMARY"
+        ws.cell(row=summary_row, column=1).font = Font(bold=True, size=12)
+        
+        summary_row += 1
+        
+        # Summary items
+        summary_items = [
+            ("Working Days Worked", working_days_count),
+            ("Leave Days Taken", len(leave_dates)),
+            ("Total Hours Worked", f"{total_worked_hours:.2f}"),
+            ("Total OT Hours", f"{total_ot_hours:.2f}"),
+        ]
+        
+        for label, value in summary_items:
+            ws.cell(row=summary_row, column=1).value = label
+            ws.cell(row=summary_row, column=1).font = summary_font
+            ws.cell(row=summary_row, column=1).fill = summary_fill
+            ws.cell(row=summary_row, column=1).border = border
+            
+            ws.cell(row=summary_row, column=2).value = value
+            ws.cell(row=summary_row, column=2).fill = summary_fill
+            ws.cell(row=summary_row, column=2).border = border
+            
+            summary_row += 1
+        
+        # Adjust column widths
+        ws.column_dimensions['A'].width = 12
+        ws.column_dimensions['B'].width = 12
+        ws.column_dimensions['C'].width = 16
+        ws.column_dimensions['D'].width = 12
+        ws.column_dimensions['E'].width = 12
+        ws.column_dimensions['F'].width = 14
+        ws.column_dimensions['G'].width = 12
+        ws.column_dimensions['H'].width = 15
+        ws.column_dimensions['I'].width = 12
+        ws.column_dimensions['J'].width = 20
+        
+        # Save to bytes
+        file_bytes = io.BytesIO()
+        wb.save(file_bytes)
+        file_bytes.seek(0)
+        
+        return StreamingResponse(
+            iter([file_bytes.getvalue()]),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={employee.employee_id}_{employee.first_name}_{year}-{month:02d}_attendance.xlsx"}
+        )
+    except Exception as e:
+        print(f"Employee export error: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
@@ -1875,7 +2273,9 @@ async def list_leave_requests(
             return []
         
         result = await db.execute(
-            select(LeaveRequest).filter(LeaveRequest.employee_id == employee.id)
+            select(LeaveRequest)
+            .filter(LeaveRequest.employee_id == employee.id)
+            .order_by(LeaveRequest.start_date)
         )
     elif current_user.user_type == UserType.MANAGER:
         # Get all leave requests for employees in manager's department
@@ -1887,9 +2287,13 @@ async def list_leave_requests(
             select(LeaveRequest)
             .join(Employee)
             .filter(Employee.department_id == manager_dept)
+            .order_by(LeaveRequest.start_date)
         )
     else:  # Admin
-        result = await db.execute(select(LeaveRequest))
+        result = await db.execute(
+            select(LeaveRequest)
+            .order_by(LeaveRequest.start_date)
+        )
     
     return result.scalars().all()
 
@@ -2215,12 +2619,65 @@ async def create_schedule(
     except:
         shift_hours = 0
     
+    # CONSTRAINT 1: Check if assigning more than 5 shifts per week
+    week_start = schedule_data.date - timedelta(days=schedule_data.date.weekday())
+    week_end = week_start + timedelta(days=6)
+    
+    week_count_result = await db.execute(
+        select(func.count(Schedule.id)).filter(
+            Schedule.employee_id == schedule_data.employee_id,
+            Schedule.date >= week_start,
+            Schedule.date <= week_end
+        )
+    )
+    existing_shifts_count = week_count_result.scalar() or 0
+    
+    if existing_shifts_count >= 5:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Cannot assign more than 5 shifts per week. Employee already has {existing_shifts_count} shifts this week (max: 5)"
+        )
+    
+    # ===== NEW CONSTRAINT: Check 5 consecutive shifts limit =====
+    # Check if this new shift would create more than 5 consecutive shifts
+    week_schedules_check = await db.execute(
+        select(Schedule).filter(
+            Schedule.employee_id == schedule_data.employee_id,
+            Schedule.date >= week_start,
+            Schedule.date <= week_end
+        ).order_by(Schedule.date)
+    )
+    existing_week_schedules = week_schedules_check.scalars().all()
+    
+    # Collect all dates including the new one
+    all_dates = sorted([s.date for s in existing_week_schedules] + [schedule_data.date])
+    all_dates = list(dict.fromkeys(all_dates))  # Remove duplicates while preserving order
+    
+    # Find the longest consecutive sequence
+    max_consecutive = 1
+    current_consecutive = 1
+    for i in range(1, len(all_dates)):
+        if (all_dates[i] - all_dates[i-1]).days == 1:
+            current_consecutive += 1
+            max_consecutive = max(max_consecutive, current_consecutive)
+        else:
+            current_consecutive = 1
+    
+    if max_consecutive > 5:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot create {max_consecutive} consecutive shifts. Maximum allowed is 5 consecutive shifts."
+        )
+    
     # Check if this creates overtime (exceeds 8hrs/day)
     overtime_required = False
     overtime_hours = 0
+    daily_overtime = False
+    weekly_overtime = False
     
     if shift_hours > 8:
         overtime_required = True
+        daily_overtime = True
         overtime_hours = shift_hours - 8
     
     # Check existing schedules for the day to see if daily limit exceeded
@@ -2244,17 +2701,16 @@ async def create_schedule(
         except:
             pass
     
-    # Total hours for the day would be existing + new
+    # CONSTRAINT 2: Total hours for the day must be 9 hrs (8 hrs work + 1 hr break)
     total_daily_hours = existing_hours + shift_hours
     
     if total_daily_hours > 8:
         overtime_required = True
-        overtime_hours = total_daily_hours - 8
+        daily_overtime = True
+        if not daily_overtime or shift_hours <= 8:
+            overtime_hours = total_daily_hours - 8
     
-    # Check weekly hours
-    week_start = schedule_data.date - timedelta(days=schedule_data.date.weekday())
-    week_end = week_start + timedelta(days=6)
-    
+    # CONSTRAINT 3: Check weekly hours - max 40 hours per week
     week_result = await db.execute(
         select(Schedule).filter(
             Schedule.employee_id == schedule_data.employee_id,
@@ -2277,9 +2733,11 @@ async def create_schedule(
             pass
     
     total_weekly_hours = existing_weekly_hours + shift_hours
+    weekly_overtime_hours = 0
     
     if total_weekly_hours > 40:
         overtime_required = True
+        weekly_overtime = True
         weekly_overtime_hours = total_weekly_hours - 40
     
     # If overtime required, return info about it (frontend will show popup)
@@ -2311,25 +2769,34 @@ async def create_schedule(
             await db.commit()
             await db.refresh(tracking)
         
-        has_sufficient_ot = tracking.remaining_hours >= overtime_hours
+        total_overtime_hours = max(overtime_hours, weekly_overtime_hours)
+        has_sufficient_ot = tracking.remaining_hours >= total_overtime_hours
+        
+        messages = []
+        if daily_overtime:
+            messages.append(f"Daily overtime: {overtime_hours:.1f}h")
+        if weekly_overtime:
+            messages.append(f"Weekly overtime: {weekly_overtime_hours:.1f}h")
         
         return {
             "id": None,
             "status": "requires_overtime_approval",
-            "message": f"This schedule requires {overtime_hours:.1f}h overtime",
+            "message": f"Overtime required: {', '.join(messages)}",
             "employee_id": schedule_data.employee_id,
             "employee_name": f"{employee.first_name} {employee.last_name}",
             "date": schedule_data.date.isoformat(),
             "start_time": schedule_data.start_time,
             "end_time": schedule_data.end_time,
             "shift_hours": shift_hours,
-            "overtime_hours": overtime_hours,
-            "total_daily_hours": total_daily_hours if total_daily_hours > 8 else None,
-            "total_weekly_hours": total_weekly_hours if total_weekly_hours > 40 else None,
+            "overtime_hours": total_overtime_hours,
+            "total_daily_hours": total_daily_hours if total_daily_hours > 8 else shift_hours,
+            "total_weekly_hours": total_weekly_hours,
             "allocated_ot_hours": tracking.allocated_hours,
             "used_ot_hours": tracking.used_hours,
             "remaining_ot_hours": tracking.remaining_hours,
-            "has_sufficient_ot": has_sufficient_ot
+            "has_sufficient_ot": has_sufficient_ot,
+            "daily_overtime": daily_overtime,
+            "weekly_overtime": weekly_overtime
         }
     
     # Create schedule normally if no overtime required
@@ -2374,6 +2841,43 @@ async def update_schedule(
         manager_dept = await get_manager_department(current_user, db)
         if not manager_dept or schedule.department_id != manager_dept:
             raise HTTPException(status_code=403, detail="Can only edit schedules in your department")
+
+    # ===== NEW: Validate consecutive shifts when changing date =====
+    if schedule_data.date and schedule_data.date != schedule.date:
+        new_date = schedule_data.date if isinstance(schedule_data.date, date) else datetime.strptime(schedule_data.date, '%Y-%m-%d').date()
+        
+        week_start = new_date - timedelta(days=new_date.weekday())
+        week_end = week_start + timedelta(days=6)
+        
+        week_schedules_check = await db.execute(
+            select(Schedule).filter(
+                Schedule.employee_id == schedule.employee_id,
+                Schedule.date >= week_start,
+                Schedule.date <= week_end,
+                Schedule.id != schedule_id  # Exclude current schedule
+            ).order_by(Schedule.date)
+        )
+        existing_week_schedules = week_schedules_check.scalars().all()
+        
+        # Collect all dates including the new one
+        all_dates = sorted([s.date for s in existing_week_schedules] + [new_date])
+        all_dates = list(dict.fromkeys(all_dates))  # Remove duplicates while preserving order
+        
+        # Find the longest consecutive sequence
+        max_consecutive = 1
+        current_consecutive = 1
+        for i in range(1, len(all_dates)):
+            if (all_dates[i] - all_dates[i-1]).days == 1:
+                current_consecutive += 1
+                max_consecutive = max(max_consecutive, current_consecutive)
+            else:
+                current_consecutive = 1
+        
+        if max_consecutive > 5:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot create {max_consecutive} consecutive shifts. Maximum allowed is 5 consecutive shifts."
+            )
 
     for key, value in schedule_data.dict(exclude_unset=True).items():
         # Convert string date to date object if needed
@@ -2420,6 +2924,7 @@ async def delete_schedule(
 async def generate_schedules(
     start_date: date,
     end_date: date,
+    regenerate: bool = False,
     current_user: User = Depends(require_manager),
     db: AsyncSession = Depends(get_db)
 ):
@@ -2442,6 +2947,70 @@ async def generate_schedules(
             raise HTTPException(status_code=400, detail="Manager department not found")
 
         print(f"[DEBUG] Department ID: {department_id}", flush=True)
+
+        # ===== NEW: Check if schedules already exist in this date range =====
+        existing_schedules_result = await db.execute(
+            select(Schedule)
+            .filter(
+                Schedule.department_id == department_id,
+                Schedule.date >= start_date,
+                Schedule.date <= end_date
+            )
+        )
+        existing_schedules = existing_schedules_result.scalars().all()
+        
+        if existing_schedules and not regenerate:
+            # Return message asking if user wants to regenerate
+            return {
+                "success": False,
+                "schedules_created": 0,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "requires_confirmation": True,
+                "existing_count": len(existing_schedules),
+                "feedback": [
+                    f"⚠️  Found {len(existing_schedules)} existing schedules for this date range.",
+                    "Do you want to regenerate and replace them?"
+                ],
+                "schedules": []
+            }
+        
+        # If regenerate is True, delete existing schedules first
+        if existing_schedules and regenerate:
+            print(f"[DEBUG] Regenerating - deleting {len(existing_schedules)} existing schedules", flush=True)
+            
+            # First, nullify schedule_id in check_ins table for affected date range
+            # to avoid foreign key constraint violations
+            affected_schedules_result = await db.execute(
+                select(Schedule.id)
+                .filter(
+                    Schedule.department_id == department_id,
+                    Schedule.date >= start_date,
+                    Schedule.date <= end_date
+                )
+            )
+            affected_schedule_ids = affected_schedules_result.scalars().all()
+            
+            if affected_schedule_ids:
+                await db.execute(
+                    update(CheckInOut)
+                    .where(CheckInOut.schedule_id.in_(affected_schedule_ids))
+                    .values(schedule_id=None)
+                )
+            
+            # Now delete the schedules
+            await db.execute(
+                delete(Schedule)
+                .filter(
+                    Schedule.department_id == department_id,
+                    Schedule.date >= start_date,
+                    Schedule.date <= end_date
+                )
+            )
+            await db.commit()
+            feedback = [f"Cleared {len(existing_schedules)} existing schedules. Generating new schedule..."]
+        else:
+            feedback = []
 
         # Get all roles in this department
         roles_result = await db.execute(
@@ -2470,9 +3039,37 @@ async def generate_schedules(
         shifts = shifts_result.scalars().all()
         print(f"[DEBUG] Found {len(shifts)} shifts", flush=True)
 
-        # Log shift details
+        # Log shift details and ensure all shifts have schedule_config
+        print(f"[DEBUG] Processing {len(shifts)} shifts for schedule_config validation", flush=True)
         for shift in shifts:
-            print(f"[DEBUG] Shift: {shift.id} - {shift.name}, active={shift.is_active}, time={shift.start_time}-{shift.end_time}, min_emp={shift.min_emp}, role_id={shift.role_id}", flush=True)
+            # For backward compatibility:
+            # - If shift has NO schedule_config or empty, assume ALL days are enabled
+            # - If shift has schedule_config, use the configured days
+            if not shift.schedule_config or not isinstance(shift.schedule_config, dict) or len(shift.schedule_config) == 0:
+                print(f"[DEBUG] Shift {shift.id} ({shift.name}) has empty/invalid schedule_config, enabling all days for backward compatibility", flush=True)
+                # Old shift without schedule_config - enable all days for backward compatibility
+                shift.schedule_config = {
+                    'Monday': {'enabled': True},
+                    'Tuesday': {'enabled': True},
+                    'Wednesday': {'enabled': True},
+                    'Thursday': {'enabled': True},
+                    'Friday': {'enabled': True},
+                    'Saturday': {'enabled': True},
+                    'Sunday': {'enabled': True}
+                }
+            else:
+                # Ensure all days have proper structure
+                if isinstance(shift.schedule_config, dict):
+                    for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
+                        if day not in shift.schedule_config or not isinstance(shift.schedule_config[day], dict):
+                            # Missing day or malformed - fix it
+                            shift.schedule_config[day] = {'enabled': False}
+                        elif 'enabled' not in shift.schedule_config[day]:
+                            # Missing 'enabled' key - add it
+                            shift.schedule_config[day]['enabled'] = False
+            
+            enabled_days = [day for day, cfg in shift.schedule_config.items() if isinstance(cfg, dict) and cfg.get('enabled', False)]
+            print(f"[DEBUG] Final Shift: {shift.id} - {shift.name}, enabled_days={enabled_days}", flush=True)
 
         if not shifts:
             return {
@@ -2510,154 +3107,245 @@ async def generate_schedules(
         current_date = start_date
         schedules_created = 0
         feedback = []
+        overtime_warnings = []  # Track shifts requiring overtime approval
 
         # Group shifts by role for fair distribution
         shifts_by_role = defaultdict(list)
         for shift in shifts:
             shifts_by_role[shift.role_id].append(shift)
 
-        # Calculate employee capacity and pre-assign shifts
-        shift_assignments = defaultdict(lambda: defaultdict(int))  # {shift_id: {emp_id: count}}
+        # Calculate which employees are eligible for each shift (based on role)
+        # Strategy: Assign employees to shifts day-by-day
+        # Each employee gets ONE shift per day maximum (no double shifts)
+        # If shifts are Mon-Friday, all eligible employees get all 5 days
+        eligible_for_shift = {}  # {shift_id: [emp1, emp2, emp3...]} - only eligible employees per shift
 
-        # For each shift, distribute based on employee capacity
+        print(f"[DEBUG] Building eligibility matrix for {len(shifts)} shifts and {len(employees)} employees", flush=True)
         for shift in shifts:
-            # Distribute this shift across employees based on capacity
+            eligible_for_shift[shift.id] = []
+            
             for emp in employees:
-                # Only assign employees who are either:
-                # 1. Not assigned to any specific role (flexible), OR
-                # 2. Assigned to this shift's role
-                if emp.role_id is not None and emp.role_id != shift.role_id:
-                    continue  # Skip employees not assigned to this role
-
-                # Calculate employee capacity for this week
-                weekly_hours = emp.weekly_hours or 40
-                daily_max = emp.daily_max_hours or 8
-                shifts_per_week = emp.shifts_per_week or 5
-
-                # Max shifts this employee can work per week (most limiting factor)
-                max_capacity = min(shifts_per_week, int(weekly_hours / daily_max))
-
-                # Simply assign the full capacity for each shift they're eligible for
-                # The actual schedule creation loop will handle the distribution
-                shift_assignments[shift.id][emp.id] = max_capacity
-                print(f"[DEBUG] Assigned {emp.id} ({emp.first_name}) to shift {shift.id} with capacity {max_capacity}", flush=True)
+                # Employee is eligible if:
+                # 1. They have no specific role assignment (flexible=True), OR
+                # 2. Their role matches the shift's role
+                is_eligible = (emp.role_id is None) or (emp.role_id == shift.role_id)
+                
+                if is_eligible:
+                    eligible_for_shift[shift.id].append(emp)
+                    print(f"[DEBUG] Shift {shift.id} ({shift.name}): {emp.id} ({emp.first_name}) is ELIGIBLE", flush=True)
+                else:
+                    print(f"[DEBUG] Shift {shift.id} ({shift.name}): {emp.id} ({emp.first_name}) is NOT eligible (role mismatch: emp.role={emp.role_id} vs shift.role={shift.role_id})", flush=True)
 
         # Create schedules
         current_date = start_date
         while current_date <= end_date:
-            day_name = current_date.strftime('%A').lower()
+            day_name = current_date.strftime('%A')  # e.g., 'Monday', 'Sunday'
 
             for shift in shifts:
                 # Check if shift operates on this day
                 role = next((r for r in roles if r.id == shift.role_id), None)
-                print(f"[DEBUG] Processing shift {shift.id} on {current_date} ({day_name}), role schedule_config: {role.schedule_config if role else 'N/A'}", flush=True)
-
-                # Check if role has schedule_config - if yes, only process enabled days
-                # If no schedule_config, assume all days are enabled
+                
+                # Determine if this shift should run on this day
                 should_skip = False
-                if role and role.schedule_config and isinstance(role.schedule_config, dict) and len(role.schedule_config) > 0:
-                    # Role has a schedule_config, so only process days that are explicitly enabled
-                    if not role.schedule_config.get(day_name, False):
+                
+                if shift.schedule_config and isinstance(shift.schedule_config, dict):
+                    # Shift has a schedule_config with day configuration
+                    day_config = shift.schedule_config.get(day_name, {})
+                    is_day_enabled = day_config.get('enabled', False) if isinstance(day_config, dict) else False
+                    
+                    if not is_day_enabled:
                         should_skip = True
-                        print(f"[DEBUG] ✗ Day {day_name} is disabled for role {role.id}, skipping", flush=True)
+                        print(f"[DEBUG] ✗ Shift {shift.id} ({shift.name}) - Day {day_name} is disabled, skipping", flush=True)
+                    else:
+                        print(f"[DEBUG] ✓ Shift {shift.id} ({shift.name}) - Day {day_name} is ENABLED, processing", flush=True)
+                else:
+                    # No schedule_config or invalid format - skip to prevent unintended assignments
+                    should_skip = True
+                    print(f"[DEBUG] ✗ Shift {shift.id} ({shift.name}) - No valid schedule_config, skipping {day_name}", flush=True)
 
                 if should_skip:
                     continue
-                else:
-                    print(f"[DEBUG] ✓ Processing day {day_name} for role {role.id if role else 'N/A'}", flush=True)
 
                 # Assign employees to this shift on this day
+                # Only consider employees who are eligible for this shift
                 assigned_count = 0
-                for emp in employees:
-                    if (shift.id in shift_assignments and
-                        emp.id in shift_assignments[shift.id] and
-                        shift_assignments[shift.id][emp.id] > 0):
-                        print(f"[DEBUG] Checking {emp.first_name} for shift {shift.id} on {current_date}, remaining: {shift_assignments[shift.id][emp.id]}", flush=True)
-
-                        # Check if employee has leave or is unavailable
-                        leave_result = await db.execute(
-                            select(LeaveRequest)
-                            .filter(
-                                LeaveRequest.employee_id == emp.id,
-                                LeaveRequest.start_date <= current_date,
-                                LeaveRequest.end_date >= current_date,
-                                LeaveRequest.status == LeaveStatus.APPROVED
-                            )
+                
+                for emp in eligible_for_shift[shift.id]:
+                    # Check leave - if employee is on approved leave, mark them as leave (not shift)
+                    leave_result = await db.execute(
+                        select(LeaveRequest)
+                        .filter(
+                            LeaveRequest.employee_id == emp.id,
+                            LeaveRequest.start_date <= current_date,
+                            LeaveRequest.end_date >= current_date,
+                            LeaveRequest.status == LeaveStatus.APPROVED
                         )
-                        if leave_result.scalar_one_or_none():
-                            continue  # Skip if employee is on leave
-
-                        # Check if employee exceeded weekly hours limit
-                        week_start = current_date - timedelta(days=current_date.weekday())
-                        week_end = week_start + timedelta(days=6)
-
-                        # Fetch existing schedules for the week (with eager loading of role)
-                        existing_schedules_result = await db.execute(
+                    )
+                    leave_request = leave_result.scalars().first()
+                    
+                    if leave_request:
+                        # Employee is on approved leave - create a LEAVE schedule entry
+                        # (This counts as one of their working days, but marked as leave)
+                        existing_today = await db.execute(
                             select(Schedule)
                             .filter(
                                 Schedule.employee_id == emp.id,
-                                Schedule.date >= week_start,
-                                Schedule.date <= week_end
+                                Schedule.date == current_date
                             )
-                            .options(selectinload(Schedule.role))
                         )
-                        existing_schedules = existing_schedules_result.scalars().all()
-
-                        # Calculate existing hours in Python, subtracting break time
-                        existing_hours = 0
-                        existing_hours_today = 0
-                        for sched in existing_schedules:
-                            if sched.start_time and sched.end_time:
-                                try:
-                                    start = datetime.strptime(sched.start_time, '%H:%M')
-                                    end = datetime.strptime(sched.end_time, '%H:%M')
-                                    total_hours = (end - start).total_seconds() / 3600
-
-                                    # Subtract break time from role
-                                    break_hours = (sched.role.break_minutes or 0) / 60 if sched.role else 0
-                                    work_hours = total_hours - break_hours
-
-                                    existing_hours += work_hours
-                                    # Check hours for current day
-                                    if sched.date == current_date:
-                                        existing_hours_today += work_hours
-                                except (ValueError, TypeError):
-                                    pass
-
-                        # Calculate shift hours (total time) and work hours (minus breaks)
-                        shift_start = datetime.strptime(shift.start_time, '%H:%M')
-                        shift_end = datetime.strptime(shift.end_time, '%H:%M')
-                        total_shift_hours = (shift_end - shift_start).total_seconds() / 3600
-
-                        # Subtract break time from role
-                        break_hours = (role.break_minutes or 0) / 60
-                        work_hours = total_shift_hours - break_hours
-
-                        # Check both weekly and daily limits using work hours (excluding breaks)
-                        daily_max = emp.daily_max_hours or 8
-                        print(f"[DEBUG] Hours check: existing_weekly={existing_hours:.1f} + work={work_hours:.1f} <= {emp.weekly_hours} AND existing_daily={existing_hours_today:.1f} + work={work_hours:.1f} <= {daily_max}", flush=True)
-
-                        if (existing_hours + work_hours <= emp.weekly_hours and
-                            existing_hours_today + work_hours <= daily_max):
-                            print(f"[DEBUG] ✓ Creating schedule for {emp.first_name} on {current_date}", flush=True)
-                            # Create schedule
-                            schedule = Schedule(
+                        if not existing_today.scalars().first():
+                            # No schedule exists for this day yet - create a leave entry
+                            print(f"[DEBUG] ✓ {emp.first_name} is on approved leave on {current_date}, creating LEAVE schedule", flush=True)
+                            leave_schedule = Schedule(
                                 department_id=department_id,
                                 employee_id=emp.id,
                                 role_id=shift.role_id,
                                 shift_id=shift.id,
                                 date=current_date,
-                                start_time=shift.start_time,
-                                end_time=shift.end_time,
-                                status="scheduled"
+                                start_time=None,
+                                end_time=None,
+                                status="leave"  # Mark as leave, not shift
                             )
-                            db.add(schedule)
+                            db.add(leave_schedule)
                             schedules_created += 1
-                            assigned_count += 1
-                            shift_assignments[shift.id][emp.id] -= 1
+                        else:
+                            print(f"[DEBUG] ✗ {emp.first_name} already has a schedule entry on {current_date}, skipping leave creation", flush=True)
+                        continue  # Don't assign shift for leave day
+                    
+                    # CRITICAL: Check if employee already has a shift on this day (NO DOUBLE SHIFTS)
+                    existing_today = await db.execute(
+                        select(Schedule)
+                        .filter(
+                            Schedule.employee_id == emp.id,
+                            Schedule.date == current_date
+                        )
+                    )
+                    if existing_today.scalars().first():
+                        print(f"[DEBUG] ✗ {emp.first_name} already has a shift on {current_date}, skipping (NO DOUBLE SHIFTS)", flush=True)
+                        continue  # Skip if employee already has a shift today
+                    
+                    print(f"[DEBUG] Checking {emp.first_name} ({emp.id}) for shift {shift.id} ({shift.name}) on {current_date}", flush=True)
+                    
+                    # Check 5 consecutive shifts limit
+                    week_start = current_date - timedelta(days=current_date.weekday())
+                    week_end = week_start + timedelta(days=6)
+                    
+                    consecutive_check = await db.execute(
+                        select(Schedule)
+                        .filter(
+                            Schedule.employee_id == emp.id,
+                            Schedule.date >= week_start,
+                            Schedule.date <= week_end
+                        )
+                        .order_by(Schedule.date)
+                    )
+                    week_schedules = consecutive_check.scalars().all()
+                    
+                    # Check consecutive shifts INCLUDING the new one
+                    week_dates = [s.date for s in week_schedules]
+                    if current_date not in week_dates:
+                        week_dates.append(current_date)
+                    
+                    week_dates.sort()
+                    max_consecutive = 1
+                    current_consecutive = 1
+                    
+                    for i in range(1, len(week_dates)):
+                        if (week_dates[i] - week_dates[i-1]).days == 1:
+                            current_consecutive += 1
+                            max_consecutive = max(max_consecutive, current_consecutive)
+                        else:
+                            current_consecutive = 1
+                    
+                    if max_consecutive > 5:
+                        print(f"[DEBUG] ✗ {emp.first_name} would have {max_consecutive} consecutive shifts, skipping (MAX 5 consecutive)", flush=True)
+                        continue  # Skip if would exceed 5 consecutive shifts
 
-                            if assigned_count >= shift.max_emp:
-                                break  # Max employees for this shift on this day
+                    # Fetch existing schedules for the week (with eager loading of role)
+                    existing_schedules_result = await db.execute(
+                        select(Schedule)
+                        .filter(
+                            Schedule.employee_id == emp.id,
+                            Schedule.date >= week_start,
+                            Schedule.date <= week_end
+                        )
+                        .options(selectinload(Schedule.role))
+                    )
+                    existing_schedules = existing_schedules_result.scalars().all()
+
+                    # Calculate existing hours in Python, subtracting break time
+                    existing_hours = 0
+                    existing_hours_today = 0
+                    for sched in existing_schedules:
+                        if sched.start_time and sched.end_time:
+                            try:
+                                start = datetime.strptime(sched.start_time, '%H:%M')
+                                end = datetime.strptime(sched.end_time, '%H:%M')
+                                total_hours = (end - start).total_seconds() / 3600
+
+                                # Subtract break time from role
+                                break_hours = (sched.role.break_minutes or 0) / 60 if sched.role else 0
+                                work_hours = total_hours - break_hours
+
+                                existing_hours += work_hours
+                                # Check hours for current day
+                                if sched.date == current_date:
+                                    existing_hours_today += work_hours
+                            except (ValueError, TypeError):
+                                pass
+
+                    # Calculate shift hours (total time) and work hours (minus breaks)
+                    shift_start = datetime.strptime(shift.start_time, '%H:%M')
+                    shift_end = datetime.strptime(shift.end_time, '%H:%M')
+                    total_shift_hours = (shift_end - shift_start).total_seconds() / 3600
+
+                    # Subtract break time from role
+                    break_hours = (role.break_minutes or 0) / 60
+                    work_hours = total_shift_hours - break_hours
+
+                    # Check both weekly and daily limits using work hours (excluding breaks)
+                    daily_max = emp.daily_max_hours or 8
+                    print(f"[DEBUG] {emp.first_name}: weekly {existing_hours:.1f}+{work_hours:.1f}<={emp.weekly_hours}, daily {existing_hours_today:.1f}+{work_hours:.1f}<={daily_max}", flush=True)
+
+                    # ===== Check for overtime (> 9 hours total in a day) =====
+                    daily_total_with_shift = existing_hours_today + total_shift_hours
+                    has_overtime = daily_total_with_shift > 9
+                    
+                    if has_overtime:
+                        overtime_warnings.append({
+                            'employee_id': emp.id,
+                            'employee_name': f"{emp.first_name} {emp.last_name}",
+                            'date': current_date.isoformat(),
+                            'shift_hours': total_shift_hours,
+                            'existing_daily_hours': existing_hours_today,
+                            'total_daily_hours': daily_total_with_shift,
+                            'total_weekly_hours': existing_hours + work_hours,
+                            'message': f"Total {daily_total_with_shift:.1f}h on {current_date} (includes {total_shift_hours}h shift)"
+                        })
+                        print(f"[DEBUG] ⚠️  OVERTIME: {emp.first_name} would work {daily_total_with_shift:.1f} hours on {current_date}", flush=True)
+
+                    if (existing_hours + work_hours <= emp.weekly_hours and
+                        existing_hours_today + work_hours <= daily_max):
+                        print(f"[DEBUG] ✓ Creating schedule for {emp.first_name} on {current_date}", flush=True)
+                        # Create schedule
+                        schedule = Schedule(
+                            department_id=department_id,
+                            employee_id=emp.id,
+                            role_id=shift.role_id,
+                            shift_id=shift.id,
+                            date=current_date,
+                            start_time=shift.start_time,
+                            end_time=shift.end_time,
+                            status="scheduled"
+                        )
+                        db.add(schedule)
+                        schedules_created += 1
+                        assigned_count += 1
+                        
+                        if assigned_count >= shift.max_emp:
+                            break  # Max employees for this shift on this day
+                    else:
+                        print(f"[DEBUG] ✗ {emp.first_name} failed hours check on {current_date}", flush=True)
 
                 # Ensure minimum employees are assigned
                 if assigned_count < shift.min_emp:
@@ -2668,6 +3356,10 @@ async def generate_schedules(
         await db.commit()
 
         feedback.insert(0, f"Successfully generated {schedules_created} schedules")
+        
+        # Add overtime warnings to feedback
+        if overtime_warnings:
+            feedback.append(f"⚠️  {len(overtime_warnings)} overtime alert(s) - shifts exceed 9 hours on that day")
 
         return {
             "success": True,
@@ -2675,6 +3367,7 @@ async def generate_schedules(
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
             "feedback": feedback,
+            "overtime_warnings": overtime_warnings,
             "schedules": []
         }
     except HTTPException:
@@ -3439,6 +4132,83 @@ async def reject_overtime_request(
     ot_request.approved_at = datetime.utcnow()
     ot_request.approval_notes = rejection_data.get("approval_notes", "")
     
+    await db.commit()
+    await db.refresh(ot_request)
+    
+    return ot_request
+
+
+@app.post("/manager/overtime-approve", response_model=OvertimeRequestResponse)
+async def manager_approve_overtime(
+    approve_data: dict,
+    current_user: User = Depends(require_manager),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Manager directly approves overtime for an employee.
+    Creates and approves in one step.
+    
+    Request body:
+    {
+        "employee_id": 1,
+        "request_date": "2025-12-19",
+        "from_time": "18:00",
+        "to_time": "19:00",
+        "request_hours": 1.0,
+        "reason": "Project deadline"
+    }
+    """
+    employee_id = approve_data.get("employee_id")
+    request_date = approve_data.get("request_date")
+    from_time = approve_data.get("from_time")
+    to_time = approve_data.get("to_time")
+    request_hours = approve_data.get("request_hours", 0)
+    reason = approve_data.get("reason", "Manager approved")
+    
+    # Verify manager's authority
+    emp_result = await db.execute(
+        select(Employee).filter(Employee.id == employee_id)
+    )
+    employee = emp_result.scalar_one_or_none()
+    
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    
+    manager_dept = await get_manager_department(current_user, db)
+    if not manager_dept or employee.department_id != manager_dept:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    # Check if already approved for this date
+    existing = await db.execute(
+        select(OvertimeRequest).filter(
+            OvertimeRequest.employee_id == employee_id,
+            OvertimeRequest.request_date == datetime.strptime(request_date, "%Y-%m-%d").date(),
+            OvertimeRequest.status == OvertimeStatus.APPROVED
+        )
+    )
+    
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Overtime already approved for this date")
+    
+    # Create and immediately approve
+    ot_request = OvertimeRequest(
+        employee_id=employee_id,
+        request_date=datetime.strptime(request_date, "%Y-%m-%d").date(),
+        from_time=from_time,
+        to_time=to_time,
+        request_hours=float(request_hours),
+        reason=reason,
+        status=OvertimeStatus.APPROVED,
+        manager_id=current_user.id,
+        approved_at=datetime.utcnow(),
+        manager_notes="Approved by manager"
+    )
+    
+    db.add(ot_request)
+    await db.commit()
+    await db.refresh(ot_request)
+    
+    return ot_request
     await db.commit()
     await db.refresh(ot_request)
     

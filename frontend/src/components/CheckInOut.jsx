@@ -114,13 +114,13 @@ export default function CheckInOut() {
                 <div>
                   <p className="text-sm text-gray-600">Checked In</p>
                   <p className="text-xl font-semibold text-blue-900">
-                    {todayStatus.check_in_time 
-                      ? format(new Date(todayStatus.check_in_time), 'HH:mm') 
+                    {todayStatus.in_time 
+                      ? todayStatus.in_time
                       : 'Not yet'}
                   </p>
-                  {todayStatus.check_in_status && (
+                  {todayStatus.status && (
                     <p className="text-xs text-blue-600 mt-1">
-                      Status: <span className="font-semibold">{todayStatus.check_in_status}</span>
+                      Status: <span className="font-semibold">{todayStatus.status}</span>
                     </p>
                   )}
                 </div>
@@ -134,8 +134,8 @@ export default function CheckInOut() {
                 <div>
                   <p className="text-sm text-gray-600">Checked Out</p>
                   <p className="text-xl font-semibold text-purple-900">
-                    {todayStatus.check_out_time 
-                      ? format(new Date(todayStatus.check_out_time), 'HH:mm') 
+                    {todayStatus.out_time 
+                      ? todayStatus.out_time
                       : 'Not yet'}
                   </p>
                 </div>
@@ -144,17 +144,17 @@ export default function CheckInOut() {
             </div>
 
             {/* Work Duration */}
-            {todayStatus.check_in_time && todayStatus.check_out_time && (
+            {todayStatus.in_time && todayStatus.out_time && (
               <div className="p-4 bg-green-50 rounded-lg border border-green-200">
                 <p className="text-sm text-gray-600">Total Hours Worked</p>
                 <p className="text-lg font-semibold text-green-900">
-                  {calculateHours(todayStatus.check_in_time, todayStatus.check_out_time)} hours
+                  {todayStatus.worked_hours ? todayStatus.worked_hours.toFixed(2) : '0'} hours
                 </p>
               </div>
             )}
 
             {/* Action Buttons */}
-            {!todayStatus.check_out_time && (
+            {!todayStatus.out_time && todayStatus.in_time && (
               <div className="space-y-3 pt-4 border-t">
                 <Button 
                   variant="success" 
@@ -172,6 +172,20 @@ export default function CheckInOut() {
                   className="w-full p-2 border rounded text-sm"
                   rows={2}
                 />
+              </div>
+            )}
+            
+            {!todayStatus.in_time && (
+              <div className="pt-4 border-t">
+                <Button 
+                  variant="primary" 
+                  fullWidth 
+                  disabled={loading}
+                  onClick={handleCheckIn}
+                >
+                  <LogIn className="w-4 h-4 mr-2 inline" />
+                  Check In Now
+                </Button>
               </div>
             )}
           </>

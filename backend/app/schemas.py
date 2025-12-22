@@ -90,6 +90,7 @@ class UserResponse(BaseModel):
     full_name: str
     user_type: UserType
     is_active: bool
+    manager_department_id: Optional[int] = None
 
     class Config:
         from_attributes = True

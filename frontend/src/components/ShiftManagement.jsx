@@ -15,6 +15,8 @@ const ShiftManagement = ({ currentUser, departmentId }) => {
   const [shiftForm, setShiftForm] = useState({
     role_id: '',
     name: '',
+    start_time: '09:00',
+    end_time: '17:00',
     priority: 50,
     schedule_config: {}
   });
@@ -32,6 +34,7 @@ const ShiftManagement = ({ currentUser, departmentId }) => {
 
       // Load shifts
       const shiftsRes = await api.get('/shifts');
+      console.log('Loaded shifts:', shiftsRes.data);
       setShifts(shiftsRes.data);
     } catch (error) {
       console.error('Error loading data:', error);
@@ -58,6 +61,8 @@ const ShiftManagement = ({ currentUser, departmentId }) => {
     setShiftForm({
       role_id: '',
       name: '',
+      start_time: '09:00',
+      end_time: '17:00',
       priority: 50,
       schedule_config: {}
     });
@@ -66,11 +71,36 @@ const ShiftManagement = ({ currentUser, departmentId }) => {
   };
 
   const handleEditShift = (shift) => {
+    // Ensure schedule_config has all days with proper structure
+    let config = shift.schedule_config || {};
+    
+    // Validate and normalize the schedule_config
+    const normalizedConfig = {};
+    daysOfWeek.forEach(day => {
+      if (config[day] && typeof config[day] === 'object') {
+        normalizedConfig[day] = {
+          enabled: config[day].enabled || false,
+          startTime: config[day].startTime || '09:00',
+          endTime: config[day].endTime || '17:00',
+          dayPriority: config[day].dayPriority || 1
+        };
+      } else {
+        normalizedConfig[day] = {
+          enabled: false,
+          startTime: '09:00',
+          endTime: '17:00',
+          dayPriority: 1
+        };
+      }
+    });
+    
     setShiftForm({
       role_id: shift.role_id,
       name: shift.name,
+      start_time: shift.start_time || '09:00',
+      end_time: shift.end_time || '17:00',
       priority: shift.priority,
-      schedule_config: shift.schedule_config || {}
+      schedule_config: normalizedConfig
     });
     setEditingShift(shift.id);
     setShowForm(true);
@@ -95,15 +125,41 @@ const ShiftManagement = ({ currentUser, departmentId }) => {
       }
     });
 
+    // Check that at least one day is enabled
+    const enabledDays = Object.values(config).filter(d => d && d.enabled).length;
+    if (enabledDays === 0) {
+      alert('Please select at least one working day for this shift');
+      return;
+    }
+
+    // Calculate shift start_time and end_time from enabled days
+    let minStartTime = '23:59';
+    let maxEndTime = '00:00';
+    
+    Object.values(config).forEach(dayConfig => {
+      if (dayConfig && dayConfig.enabled) {
+        const startTime = dayConfig.startTime || '09:00';
+        const endTime = dayConfig.endTime || '17:00';
+        if (startTime < minStartTime) minStartTime = startTime;
+        if (endTime > maxEndTime) maxEndTime = endTime;
+      }
+    });
+
     const payload = {
       ...shiftForm,
+      start_time: minStartTime,
+      end_time: maxEndTime,
       schedule_config: config
     };
 
+    console.log('Saving shift with payload:', payload);
+
     try {
       if (editingShift) {
+        console.log(`Updating shift ${editingShift}`);
         await api.put(`/shifts/${editingShift}`, payload);
       } else {
+        console.log('Creating new shift');
         await api.post('/shifts', payload);
       }
       setShowForm(false);
