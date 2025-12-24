@@ -213,6 +213,38 @@ export const getWeeklyAttendance = (employeeId, startDate) => {
   return api.get(`/attendance/weekly/${employeeId}?${params.toString()}`);
 };
 
+// Attendance Export Functions
+export const exportMonthlyAttendance = (departmentId, year, month) => {
+  return api.get(`/attendance/export/monthly?department_id=${departmentId}&year=${year}&month=${month}`, {
+    responseType: 'blob'
+  });
+};
+
+export const exportMonthlyComprehensiveAttendance = (departmentId, year, month) => {
+  return api.get(`/attendance/export/monthly-comprehensive?department_id=${departmentId}&year=${year}&month=${month}`, {
+    responseType: 'blob'
+  });
+};
+
+export const exportWeeklyAttendance = (departmentId, startDate, endDate) => {
+  return api.get(`/attendance/export/weekly?department_id=${departmentId}&start_date=${startDate}&end_date=${endDate}`, {
+    responseType: 'blob'
+  });
+};
+
+// Calendar & Holidays
+export const getHolidays = (year, month) => {
+  return api.get(`/calendar/holidays?year=${year}&month=${month}`);
+};
+
+export const getWeekInfo = (year, month, weekNumber) => {
+  return api.get(`/calendar/week-info?year=${year}&month=${month}&week_number=${weekNumber}`);
+};
+
+export const getWeekValidation = (employeeId, year, month, week) => {
+  return api.get(`/calendar/week-validation/${employeeId}?year=${year}&month=${month}&week=${week}`);
+};
+
 // Schedule Generation
 export const generateSchedules = (startDate, endDate) => {
   const params = new URLSearchParams();

@@ -1,0 +1,135 @@
+<HTML>
+<HEAD>
+<META http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<TITLE>ERROR</TITLE>
+<STYLE type="text/css">
+<!--
+.errtitle {  font-size: 16px}
+td {  font-size: 12px}
+.prohibit-msg1{
+	margin-left: 10px;
+}
+-->
+</STYLE>
+<script language="javascript" type="text/javascript">
+<!--
+   window.addEventListener('DOMContentLoaded', function () {
+      // iframe
+      if (window.top !== window.self) {
+         var orgHTML = document.documentElement.outerHTML;
+         window.addEventListener('click', function(){
+            var newWindow = window.open("", "ifblockwindow", "width=850,height=500");
+            newWindow.document.write(orgHTML);
+            newWindow.document.close();
+         });
+      }
+
+      const ua = navigator.userAgent.toLowerCase();
+      const isiPhone = (ua.indexOf('iphone') > -1);
+      const isAndroid = ((ua.indexOf('android') > -1) && (ua.indexOf('mobile') > -1));
+      if(isiPhone || isAndroid) {
+         const head = document.head;
+         head.insertAdjacentHTML('beforeEnd', '<META name="viewport" content="width=device-width, initial-scale=1.0">');
+         let styleTag = document.createElement('style');
+         styleTag.innerText = `
+				img {
+					max-width: 100%;
+				}
+            table {
+               width: 100%;
+               max-width: 480px;
+            }
+         `;
+         head.insertAdjacentElement('beforeEnd', styleTag);
+      }
+   });
+   -->
+</script>
+</HEAD>
+
+<BODY bgcolor="#FFFFFF" text="#000000" leftmargin="16" topmargin="16" marginwidth="16" marginheight="16">
+<TABLE border="0" cellspacing="0" cellpadding="0">
+ <TR>
+  <TD class="titleimg-td"><IMG src="http://inetnf.cts/block.jpg"></TD>
+   </TR>
+</TABLE>
+<TABLE border="0" cellspacing="0" cellpadding="0" width="480" height="16">
+ <TR>
+  <TD width="480" height="16">&nbsp;</TD>
+ </TR>
+</TABLE>
+<TABLE width="480" border="0" cellpadding="6" cellspacing="0">
+ <TR>
+  <TD>
+   <FONT size="4"><SPAN class="errtitle">ページを表示できません</SPAN></FONT>
+  </TD>
+ </TR>
+</TABLE>
+<TABLE width="480" border="0" cellspacing="0" cellpadding="0">
+ <TR>
+  <TD>&nbsp;</TD>
+ </TR>
+</TABLE>
+<TABLE width="480" border="0" cellpadding="6" cellspacing="0">
+ <TR>
+  <TD>
+   サーバーに接続できません。<BR>サーバーが存在しないか、接続拒否している可能性があります。  </TD>
+ </TR>
+</TABLE>
+<TABLE border="0" cellspacing="0" cellpadding="0" width="480">
+ <TR>
+  <TD height="16">&nbsp;</TD>
+ </TR>
+ <TR>
+  <TD height="16">
+   <HR width="100%" size="2" color="#053394" noshade>
+  </TD>
+ </TR>
+</TABLE>
+<TABLE width="480" border="0" cellspacing="0" cellpadding="0">
+ <TR>
+  <TD>&nbsp;</TD>
+ </TR>
+   <TR>
+   <TD>
+    <UL>
+     <LI>ブラウザの[更新] ボタンをクリックするか、しばらくしてから再度アクセスしてください。</LI>
+     <LI>URLを正しく入力したかどうかを確認してください。</LI>
+     <LI>以前のページを表示するには、ブラウザの[戻る] ボタンをクリックしてください。</LI>
+    </UL>
+   </TD>
+  </TR>
+ </TABLE>
+ 
+ <TABLE width="480" border="0" cellspacing="0" cellpadding="4">
+    <TR>
+   <TD nowrap width="60" align="center">URL</TD>
+   <TD>http://localhost:8000/attendance/export/employee-monthly?year=2025&month=12&employee_id=EMP0100</TD>
+  </TR>
+     <TR>
+   <TD nowrap width="60" align="center">IPアドレス</TD>
+   <TD>10.200.10.81</TD>
+  </TR>
+   </TABLE>
+<TABLE border="0" cellspacing="0" cellpadding="0" width="480">
+ <TR><TD height="16"><HR width="100%" size="2" color="#053394" noshade></TD></TR>
+</TABLE>
+<TABLE width="480" border="0" cellpadding="2" cellspacing="0">
+ <TR>
+  <TD>
+     </TD>
+ </TR>
+</TABLE>
+<TABLE width="480" border="0" cellspacing="0" cellpadding="0">
+ <TR>
+  <TD>&nbsp;</TD>
+ </TR>
+</TABLE>
+<TABLE border="0" cellpadding="4" cellspacing="0">
+ <TR>
+  <TD><FONT>DateTime:</FONT></TD>
+  <TD><FONT>2025/12/24 11:11:18</FONT></TD>
+ </TR>
+</TABLE>
+</BODY>
+</HTML>

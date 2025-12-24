@@ -36,6 +36,7 @@ from app.auth import (
     get_current_active_user, require_admin, require_manager, require_employee
 )
 from app.schedule_generator import ShiftScheduleGenerator
+from app.holidays_jp import jp_calendar, is_japanese_holiday, get_japanese_holiday_name
 
 app = FastAPI(
     title="Shift Scheduler V5.1 API",
@@ -108,27 +109,77 @@ async def validate_5_shifts_per_week(
     exclude_schedule_id: Optional[int] = None
 ) -> tuple[bool, str]:
     """
-    Validate that employee doesn't exceed 5 shifts per week
+    Validate that employee doesn't exceed required shifts per week
+    
+    Rules:
+    - Base: 5 shifts per week (Mon-Fri)
+    - Exception 1: If a weekday (Mon-Fri) is a public holiday, reduce by 1
+    - Exception 2: Comp-off taken/earned on Mon-Fri counts as fulfilling shift requirement
+    - Exception 3: Comp-off earned/taken on Sat-Sun are bonus shifts (don't count)
+    
     Returns: (is_valid, error_message)
     """
     week_start = target_date - timedelta(days=target_date.weekday())
     week_end = week_start + timedelta(days=6)
     
-    query = select(func.count(Schedule.id)).filter(
+    # Get required shifts for this week (considering Japanese holidays)
+    required_shifts = jp_calendar.get_shifts_required_for_week(week_start)
+    
+    # Count WEEKDAY (Mon-Fri) coverage: regular shifts + comp-off (both count toward requirement)
+    weekday_coverage_query = select(func.count(Schedule.id)).filter(
         Schedule.employee_id == employee_id,
         Schedule.date >= week_start,
         Schedule.date <= week_end,
-        Schedule.status.in_(['scheduled', 'leave', 'comp_off_taken', 'leave_half_morning', 'leave_half_afternoon'])
+        Schedule.status.in_(['scheduled', 'leave', 'comp_off_taken', 'comp_off_earned', 'leave_half_morning', 'leave_half_afternoon']),
+        # Only count Mon-Fri (1=Mon, 5=Fri in PostgreSQL extraction)
+        func.extract('dow', Schedule.date).in_([1, 2, 3, 4, 5])
     )
     
     if exclude_schedule_id:
-        query = query.filter(Schedule.id != exclude_schedule_id)
+        weekday_coverage_query = weekday_coverage_query.filter(Schedule.id != exclude_schedule_id)
     
-    result = await db.execute(query)
-    existing_shifts_count = result.scalar() or 0
+    result = await db.execute(weekday_coverage_query)
+    weekday_coverage = result.scalar() or 0
     
-    if existing_shifts_count >= 5:
-        return False, f"Cannot assign more than 5 shifts per week. Employee already has {existing_shifts_count} shifts this week (Mon-Sun: {week_start} to {week_end})"
+    # Count weekend (Sat-Sun) shifts - only comp-off (earning extra time off) don't count
+    weekend_regular_query = select(func.count(Schedule.id)).filter(
+        Schedule.employee_id == employee_id,
+        Schedule.date >= week_start,
+        Schedule.date <= week_end,
+        Schedule.status.in_(['scheduled', 'leave', 'leave_half_morning', 'leave_half_afternoon']),  # Regular shifts only
+        # Only count Sat-Sun (6=Sat, 0=Sun in PostgreSQL extraction)
+        func.extract('dow', Schedule.date).in_([6, 0])
+    )
+    
+    if exclude_schedule_id:
+        weekend_regular_query = weekend_regular_query.filter(Schedule.id != exclude_schedule_id)
+    
+    result = await db.execute(weekend_regular_query)
+    weekend_regular_shifts = result.scalar() or 0
+    
+    # Get week info for detailed error messaging
+    week_info = jp_calendar.get_week_info(week_start)
+    holiday_str = ""
+    if week_info['weekday_holiday_count'] > 0:
+        holiday_names = [day['holiday_name'] for day in week_info['days'] if day['holiday_name']]
+        holiday_str = f" (Contains {week_info['weekday_holiday_count']} weekday holiday(s): {', '.join(holiday_names)})"
+    
+    # Check if target is weekday or weekend
+    target_weekday = target_date.weekday()  # 0=Mon, 5=Sat, 6=Sun
+    
+    if target_weekday >= 5:
+        # Weekend (Sat-Sun) shift
+        # Check if weekday requirement is already met
+        if weekday_coverage >= required_shifts:
+            return False, f"Cannot assign weekend shift on {target_date} - weekday requirement already met. Employee has {weekday_coverage} weekday shifts/comp-offs (required: {required_shifts}){holiday_str}"
+        # Weekend regular shifts also count toward total
+        total_shifts = weekday_coverage + weekend_regular_shifts
+        if total_shifts >= required_shifts:
+            return False, f"Cannot assign more than {required_shifts} shifts per week. Employee has {weekday_coverage} weekday + {weekend_regular_shifts} weekend shifts (total: {total_shifts}){holiday_str}"
+    else:
+        # Weekday (Mon-Fri) shift
+        if weekday_coverage >= required_shifts:
+            return False, f"Cannot assign more than {required_shifts} weekday shifts per week. Employee already has {weekday_coverage} weekday shifts/comp-offs (required: {required_shifts}){holiday_str} (Mon-Sun: {week_start} to {week_end})"
     
     return True, ""
 
@@ -650,6 +701,7 @@ async def create_manager(
                 "action_required": "reassign",
                 "existing_manager": {
                     "id": existing_manager.id,
+                    "manager_id": existing_manager.manager_id,
                     "user_id": existing_manager.user_id,
                     "username": existing_manager.user.username if existing_manager.user else None,
                     "full_name": existing_manager.user.full_name if existing_manager.user else None,
@@ -668,8 +720,19 @@ async def create_manager(
             existing_manager.updated_at = datetime.utcnow()
             db.add(existing_manager)  # Ensure the change is tracked
     
+    # Generate manager_id (3-digit format)
+    # Get all managers and find the max ID number
+    all_managers_result = await db.execute(select(Manager))
+    all_managers = all_managers_result.scalars().all()
+    max_id = max([int(m.manager_id) for m in all_managers if m.manager_id.isdigit()], default=0)
+    new_manager_id = f"{max_id + 1:03d}"
+    
     # Create new manager
-    manager = Manager(**mgr_data.dict())
+    manager = Manager(
+        manager_id=new_manager_id,
+        user_id=mgr_data.user_id,
+        department_id=mgr_data.department_id
+    )
     db.add(manager)
     await db.commit()
     await db.refresh(manager)
@@ -679,11 +742,13 @@ async def create_manager(
         "message": "Manager assigned successfully",
         "manager": {
             "id": manager.id,
+            "manager_id": manager.manager_id,
             "user_id": manager.user_id,
             "department_id": manager.department_id,
             "is_active": manager.is_active
         }
     }
+
 
 
 @app.get("/managers", response_model=List[ManagerDetailResponse])
@@ -705,6 +770,7 @@ async def list_managers(
         user = manager.user
         response.append({
             'id': manager.id,
+            'manager_id': manager.manager_id,
             'user_id': manager.user_id,
             'username': user.username if user else None,
             'full_name': user.full_name if user else None,
@@ -749,9 +815,8 @@ async def update_manager(
             )
     
     manager.department_id = mgr_data.department_id
-    manager = mgr_data
-    manager = mgr_data
     manager.updated_at = datetime.utcnow()
+    db.add(manager)
     
     await db.commit()
     await db.refresh(manager)
@@ -1202,6 +1267,7 @@ async def check_in(
 ):
     try:
         today = date.today()
+        print(f"[CHECK-IN] User ID: {current_user.id}, Date: {today}")
         
         # Get employee by user_id
         result = await db.execute(
@@ -1210,7 +1276,11 @@ async def check_in(
         employee = result.scalar_one_or_none()
         
         if not employee:
-            raise HTTPException(status_code=400, detail="Employee record not found for this user")
+            error_msg = f"Employee record not found for user_id: {current_user.id}"
+            print(f"[CHECK-IN ERROR] {error_msg}")
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        print(f"[CHECK-IN] Employee found: {employee.id}, name: {employee.first_name} {employee.last_name}")
         
         # Check if already checked in
         result = await db.execute(
@@ -1221,7 +1291,9 @@ async def check_in(
             )
         )
         if result.scalar_one_or_none():
-            raise HTTPException(status_code=400, detail="Already checked in today. Please check out first.")
+            error_msg = "Already checked in today. Please check out first."
+            print(f"[CHECK-IN ERROR] {error_msg}")
+            raise HTTPException(status_code=400, detail=error_msg)
         
         # Get today's schedule
         result = await db.execute(
@@ -1233,7 +1305,9 @@ async def check_in(
         schedule = result.scalar_one_or_none()
         
         if not schedule:
-            raise HTTPException(status_code=400, detail="No scheduled shift for today. Please contact your manager.")
+            error_msg = f"No scheduled shift for today. Please contact your manager. (Employee: {employee.id}, Date: {today})"
+            print(f"[CHECK-IN ERROR] {error_msg}")
+            raise HTTPException(status_code=400, detail=error_msg)
         
         # Calculate late status
         now = datetime.now()
@@ -1273,6 +1347,42 @@ async def check_in(
         db.add(check_in)
         await db.commit()
         
+        # Also create or update Attendance record immediately on check-in
+        try:
+            att_result = await db.execute(
+                select(Attendance).filter(
+                    Attendance.employee_id == employee.id,
+                    Attendance.date == today
+                )
+            )
+            attendance = att_result.scalar_one_or_none()
+            
+            if not attendance:
+                # Create new attendance record with check-in time
+                attendance = Attendance(
+                    employee_id=employee.id,
+                    schedule_id=schedule.id,
+                    date=today,
+                    in_time=now.strftime("%H:%M") if now else None,
+                    status=status_val,
+                    out_time=None,
+                    worked_hours=0,
+                    overtime_hours=0,
+                    break_minutes=0
+                )
+                db.add(attendance)
+            else:
+                # Update existing record with check-in time if not already set
+                if not attendance.in_time:
+                    attendance.in_time = now.strftime("%H:%M") if now else None
+                    attendance.status = status_val
+            
+            await db.commit()
+            print(f"[CHECK-IN] Attendance record created/updated for employee {employee.id}")
+        except Exception as att_error:
+            print(f"[CHECK-IN WARNING] Failed to create attendance record: {str(att_error)}")
+            # Don't fail the check-in if attendance record fails
+        
         # Refresh with proper eager loading
         result = await db.execute(
             select(CheckInOut)
@@ -1288,10 +1398,11 @@ async def check_in(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Check-in error: {str(e)}")
+        error_msg = str(e)
+        print(f"[CHECK-IN EXCEPTION] {error_msg}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Check-in failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Check-in failed: {error_msg}")
 
 
 @app.post("/employee/check-out", response_model=CheckInResponse)
@@ -1302,6 +1413,7 @@ async def check_out(
 ):
     try:
         today = date.today()
+        print(f"[CHECK-OUT] User ID: {current_user.id}, Date: {today}")
         
         # Get employee by user_id
         result = await db.execute(
@@ -1310,7 +1422,9 @@ async def check_out(
         employee = result.scalar_one_or_none()
         
         if not employee:
-            raise HTTPException(status_code=400, detail="Employee record not found")
+            error_msg = f"Employee record not found for user_id: {current_user.id}"
+            print(f"[CHECK-OUT ERROR] {error_msg}")
+            raise HTTPException(status_code=400, detail=error_msg)
 
         # Find today's check-in
         result = await db.execute(
@@ -1470,10 +1584,11 @@ async def check_out(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Check-out error: {str(e)}")
+        error_msg = str(e)
+        print(f"[CHECK-OUT EXCEPTION] {error_msg}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Check-out failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Check-out failed: {error_msg}")
 
 
 @app.post("/attendance/record")
@@ -1540,7 +1655,7 @@ async def record_attendance(
 
 
 # Attendance Management
-@app.get("/attendance")
+@app.get("/attendance", response_model=List[AttendanceResponse])
 async def get_attendance(
     start_date: date = None,
     end_date: date = None,
@@ -1587,67 +1702,6 @@ async def get_attendance(
 
     result = await db.execute(query.order_by(Attendance.date.desc()))
     attendance_records = list(result.scalars().all())
-    
-    # For today, also check for active check-ins (CheckInOut without checkout)
-    today = date.today()
-    if not start_date or start_date <= today:
-        if not end_date or end_date >= today:
-            # Get active check-ins for today
-            if current_user.user_type == UserType.EMPLOYEE and target_employee:
-                checkin_query = select(CheckInOut).filter(
-                    CheckInOut.employee_id == target_employee.id,
-                    CheckInOut.date == today,
-                    CheckInOut.check_out_time == None
-                ).options(
-                    selectinload(CheckInOut.employee),
-                    selectinload(CheckInOut.schedule).selectinload(Schedule.role)
-                )
-            elif current_user.user_type == UserType.MANAGER and manager_dept:
-                subquery = select(Employee.id).filter(Employee.department_id == manager_dept)
-                checkin_query = select(CheckInOut).filter(
-                    CheckInOut.employee_id.in_(subquery),
-                    CheckInOut.date == today,
-                    CheckInOut.check_out_time == None
-                ).options(
-                    selectinload(CheckInOut.employee),
-                    selectinload(CheckInOut.schedule).selectinload(Schedule.role)
-                )
-            else:
-                checkin_query = select(CheckInOut).filter(
-                    CheckInOut.date == today,
-                    CheckInOut.check_out_time == None
-                ).options(
-                    selectinload(CheckInOut.employee),
-                    selectinload(CheckInOut.schedule).selectinload(Schedule.role)
-                )
-            
-            checkin_result = await db.execute(checkin_query)
-            active_checkins = list(checkin_result.scalars().all())
-            
-            # Convert CheckInOut to Attendance-like response for return
-            for checkin in active_checkins:
-                # Check if there's already an Attendance record for this employee today
-                existing = any(r.employee_id == checkin.employee_id and r.date == today for r in attendance_records)
-                if not existing:
-                    # Convert CheckInOut to dict matching AttendanceResponse
-                    att_dict = {
-                        'id': checkin.id,
-                        'employee_id': checkin.employee_id,
-                        'schedule_id': checkin.schedule_id,
-                        'date': checkin.date,
-                        'in_time': checkin.check_in_time.strftime("%H:%M") if checkin.check_in_time else None,
-                        'out_time': None,
-                        'status': checkin.check_in_status or 'onTime',
-                        'out_status': None,
-                        'worked_hours': 0.0,
-                        'overtime_hours': 0.0,
-                        'break_minutes': 0,
-                        'notes': None,
-                        'created_at': checkin.date,
-                        'employee': checkin.employee,
-                        'schedule': checkin.schedule
-                    }
-                    attendance_records.append(att_dict)
     
     return attendance_records
 
@@ -1808,35 +1862,153 @@ async def export_monthly_attendance(
 
         # Create workbook
         wb = Workbook()
-        ws = wb.active
-        ws.title = f"Attendance"
-
-        # Header styles
+        
+        # Define professional styles
         header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-        header_font = Font(bold=True, color="FFFFFF")
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        title_font = Font(bold=True, size=14)
+        section_font = Font(bold=True, size=12)
         border = Border(
             left=Side(style='thin'),
             right=Side(style='thin'),
             top=Side(style='thin'),
             bottom=Side(style='thin')
         )
-
+        center_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        summary_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+        summary_font = Font(bold=True, color="000000")
+        
+        # Create Summary Sheet First
+        summary_ws = wb.active
+        summary_ws.title = "Summary"
+        
         # Title
+        summary_ws['A1'] = f"{department.name} - Monthly Attendance Summary"
+        summary_ws['A1'].font = title_font
+        summary_ws.merge_cells('A1:B1')
+        
+        summary_ws['A2'] = f"{calendar.month_name[month]} {year}"
+        summary_ws['A2'].font = Font(size=11)
+        summary_ws.merge_cells('A2:B2')
+        
+        summary_ws['A3'] = ""
+        
+        # Get all dates in the month to calculate statistics
+        from dateutil.rrule import rrule, DAILY
+        import datetime
+        all_dates = list(rrule(DAILY, dtstart=start_date, until=end_date))
+        
+        # Calculate public holidays and weekends
+        from app.holidays_jp import JapaneseCalendar
+        jp_calendar = JapaneseCalendar()
+        jp_holidays_dict = jp_calendar.get_holidays_in_range(start_date, end_date)
+        
+        # Count working days, holidays, weekends
+        public_holidays = 0
+        weekends = 0
+        working_days_available = 0
+        
+        for current_date in all_dates:
+            date_obj = current_date.date() if hasattr(current_date, 'date') else current_date
+            is_weekend = date_obj.weekday() >= 5  # Saturday = 5, Sunday = 6
+            is_public_holiday = date_obj in jp_holidays_dict
+            
+            if is_public_holiday:
+                public_holidays += 1
+            elif is_weekend:
+                weekends += 1
+            else:
+                working_days_available += 1
+        
+        # Calculate totals from attendance records
+        total_worked_hours = 0
+        total_overtime_hours = 0
+        working_days_actual = 0
+        
+        for record in attendance_records:
+            if record.worked_hours and record.worked_hours > 0:
+                total_worked_hours += record.worked_hours
+                working_days_actual += 1
+            if record.overtime_hours:
+                total_overtime_hours += record.overtime_hours
+        
+        # Summary data with styling
+        summary_ws['A4'] = "DEPARTMENT STATISTICS"
+        summary_ws['A4'].font = section_font
+        summary_ws['A4'].fill = summary_fill
+        summary_ws['A4'].border = border
+        summary_ws['B4'].fill = summary_fill
+        summary_ws['B4'].border = border
+        
+        summary_data = [
+            ['Total Days in Month', len(all_dates)],
+            ['Public Holidays', public_holidays],
+            ['Weekends (Sat/Sun)', weekends],
+            ['Total Non-Working Days', public_holidays + weekends],
+            ['Working Days Available', working_days_available],
+            ['Total Working Days Completed', working_days_actual],
+            ['', ''],
+            ['Total Working Hours (All Employees)', f'{total_worked_hours:.2f}'],
+            ['Total Overtime Hours (All Employees)', f'{total_overtime_hours:.2f}'],
+        ]
+        
+        row = 5
+        for label, value in summary_data:
+            summary_ws[f'A{row}'] = label
+            summary_ws[f'B{row}'] = value
+            if label:  # Skip empty rows
+                summary_ws[f'A{row}'].font = summary_font
+                summary_ws[f'A{row}'].fill = summary_fill
+                summary_ws[f'B{row}'].border = border
+                summary_ws[f'B{row}'].alignment = Alignment(horizontal='right')
+            summary_ws[f'A{row}'].border = border
+            row += 1
+        
+        # Holiday Details
+        holiday_row = row + 1
+        summary_ws[f'A{holiday_row}'] = "PUBLIC HOLIDAYS IN THIS MONTH"
+        summary_ws[f'A{holiday_row}'].font = section_font
+        summary_ws[f'A{holiday_row}'].fill = summary_fill
+        summary_ws[f'A{holiday_row}'].border = border
+        summary_ws[f'B{holiday_row}'].fill = summary_fill
+        summary_ws[f'B{holiday_row}'].border = border
+        summary_ws.merge_cells(f'A{holiday_row}:B{holiday_row}')
+        
+        holiday_row += 1
+        for holiday_date, holiday_name in jp_holidays_dict.items():
+            summary_ws[f'A{holiday_row}'] = holiday_date.isoformat()
+            summary_ws[f'B{holiday_row}'] = holiday_name
+            summary_ws[f'A{holiday_row}'].border = border
+            summary_ws[f'B{holiday_row}'].border = border
+            holiday_row += 1
+        
+        # Adjust column widths for summary
+        summary_ws.column_dimensions['A'].width = 35
+        summary_ws.column_dimensions['B'].width = 20
+        
+        # Create Attendance Details Sheet
+        ws = wb.create_sheet("Attendance Details")
+        ws.title = f"Attendance Details"
+
+        # Title and Info
         ws['A1'] = f"{department.name} - Monthly Attendance Report"
-        ws['A1'].font = Font(bold=True, size=14)
-        ws.merge_cells('A1:M1')
+        ws['A1'].font = title_font
+        ws.merge_cells('A1:N1')
 
-        ws['A2'] = f"December 2025"
-        ws.merge_cells('A2:M2')
+        ws['A2'] = f"{calendar.month_name[month]} {year} | Total Employees: {len(employees)}"
+        ws['A2'].font = Font(size=11)
+        ws.merge_cells('A2:N2')
 
-        # Headers - Added Comp-Off and Leave columns
+        ws['A3'] = ""
+
+        # Headers - Same as weekly format for consistency
         headers = ['Employee ID', 'Name', 'Date', 'Leave Status', 'Assigned Shift', 'Total Hrs Assigned', 'Check-In', 'Check-Out', 'Total Hrs Worked', 'Break Time', 'Overtime Hours', 'Status', 'Comp-Off Earned', 'Comp-Off Used']
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=4, column=col)
             cell.value = header
             cell.fill = header_fill
             cell.font = header_font
-            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.alignment = center_alignment
             cell.border = border
 
         # Get schedules for shift information
@@ -1872,7 +2044,6 @@ async def export_monthly_attendance(
             comp_off_used_map[(detail.employee_id, detail_date)] = True
         
         # Get approved leave requests for the month
-        from datetime import timedelta
         leaves_result = await db.execute(
             select(LeaveRequest).filter(
                 LeaveRequest.employee_id.in_([e.id for e in employees]) if employees else False,
@@ -1895,7 +2066,7 @@ async def export_monthly_attendance(
                     }
                     leave_map[(leave.employee_id, current_date)] = leave_info
 
-        # Data
+        # Data - Similar to weekly format
         row = 5
         for record in attendance_records:
             employee = next((e for e in employees if e.id == record.employee_id), None)
@@ -1954,25 +2125,36 @@ async def export_monthly_attendance(
                 ws.cell(row=row, column=12).value = record.status or '-'
                 ws.cell(row=row, column=13).value = comp_off_earned_str
                 ws.cell(row=row, column=14).value = comp_off_used_str
+                
+                # Apply borders and alignment to all cells
                 for col in range(1, 15):
-                    ws.cell(row=row, column=col).border = border
+                    cell = ws.cell(row=row, column=col)
+                    cell.border = border
+                    cell.alignment = Alignment(horizontal='center', vertical='center') if col in [1, 3, 7, 8, 9, 10, 11, 12, 13, 14] else Alignment(horizontal='left', vertical='center')
+                    # Alternate row colors for better readability
+                    if row % 2 == 0:
+                        cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+                
                 row += 1
         
-        # Adjust column widths
-        ws.column_dimensions['A'].width = 12
-        ws.column_dimensions['B'].width = 20
-        ws.column_dimensions['C'].width = 12
-        ws.column_dimensions['D'].width = 28
-        ws.column_dimensions['E'].width = 18
-        ws.column_dimensions['F'].width = 16
-        ws.column_dimensions['G'].width = 12
-        ws.column_dimensions['H'].width = 12
-        ws.column_dimensions['I'].width = 14
-        ws.column_dimensions['J'].width = 12
-        ws.column_dimensions['K'].width = 15
-        ws.column_dimensions['L'].width = 12
-        ws.column_dimensions['M'].width = 14
-        ws.column_dimensions['N'].width = 14
+        # Set Summary as the active sheet so it shows first
+        wb.active = wb['Summary']
+        
+        # Adjust column widths for better readability
+        ws.column_dimensions['A'].width = 13  # Employee ID
+        ws.column_dimensions['B'].width = 22  # Name
+        ws.column_dimensions['C'].width = 14  # Date
+        ws.column_dimensions['D'].width = 30  # Leave Status
+        ws.column_dimensions['E'].width = 18  # Assigned Shift
+        ws.column_dimensions['F'].width = 16  # Total Hrs Assigned
+        ws.column_dimensions['G'].width = 12  # Check-In
+        ws.column_dimensions['H'].width = 12  # Check-Out
+        ws.column_dimensions['I'].width = 16  # Total Hrs Worked
+        ws.column_dimensions['J'].width = 12  # Break Time
+        ws.column_dimensions['K'].width = 16  # Overtime Hours
+        ws.column_dimensions['L'].width = 12  # Status
+        ws.column_dimensions['M'].width = 15  # Comp-Off Earned
+        ws.column_dimensions['N'].width = 15  # Comp-Off Used
 
         # Save to bytes
         file_bytes = io.BytesIO()
@@ -1986,6 +2168,322 @@ async def export_monthly_attendance(
         )
     except Exception as e:
         print(f"Export error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+
+@app.get("/attendance/export/monthly-comprehensive")
+async def export_monthly_comprehensive_attendance(
+    department_id: int,
+    year: int,
+    month: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Export comprehensive monthly attendance report with all employee details and daily check-in/out times"""
+    try:
+        # Check authorization
+        if current_user.user_type == UserType.MANAGER:
+            manager_result = await db.execute(
+                select(Manager).filter(Manager.user_id == current_user.id, Manager.department_id == department_id)
+            )
+            if not manager_result.scalar_one_or_none():
+                raise HTTPException(status_code=403, detail="You don't have permission to download reports for this department")
+        elif current_user.user_type != UserType.ADMIN:
+            raise HTTPException(status_code=403, detail="Only admins and managers can download attendance reports")
+
+        # Get department
+        dept_result = await db.execute(select(Department).filter(Department.id == department_id))
+        department = dept_result.scalar_one_or_none()
+        if not department:
+            raise HTTPException(status_code=404, detail="Department not found")
+
+        # Get employees in department
+        emp_result = await db.execute(
+            select(Employee).filter(Employee.department_id == department_id, Employee.is_active == True)
+            .order_by(Employee.first_name)
+        )
+        employees = emp_result.scalars().all()
+
+        # Get attendance for the month
+        start_date = date(year, month, 1)
+        end_date = date(year, month, monthrange(year, month)[1])
+
+        att_result = await db.execute(
+            select(Attendance).filter(
+                Attendance.employee_id.in_([e.id for e in employees]) if employees else False,
+                Attendance.date >= start_date,
+                Attendance.date <= end_date
+            ).order_by(Attendance.employee_id, Attendance.date)
+        )
+        attendance_records = att_result.scalars().all()
+
+        # Get check-in details
+        checkin_result = await db.execute(
+            select(CheckInOut).filter(
+                CheckInOut.employee_id.in_([e.id for e in employees]) if employees else False,
+                CheckInOut.date >= start_date,
+                CheckInOut.date <= end_date
+            ).order_by(CheckInOut.employee_id, CheckInOut.date)
+        )
+        checkin_records = checkin_result.scalars().all()
+        
+        # Create checkin map for easy lookup
+        checkin_map = {}
+        for record in checkin_records:
+            checkin_map[(record.employee_id, record.date)] = record
+
+        # Get schedules
+        sched_result = await db.execute(
+            select(Schedule).filter(
+                Schedule.employee_id.in_([e.id for e in employees]) if employees else False,
+                Schedule.date >= start_date,
+                Schedule.date <= end_date
+            )
+        )
+        schedules = sched_result.scalars().all()
+        schedule_map = {}
+        for sched in schedules:
+            schedule_map[(sched.employee_id, sched.date)] = sched
+
+        # Get approved leave requests
+        leaves_result = await db.execute(
+            select(LeaveRequest).filter(
+                LeaveRequest.employee_id.in_([e.id for e in employees]) if employees else False,
+                LeaveRequest.start_date <= end_date,
+                LeaveRequest.end_date >= start_date,
+                LeaveRequest.status == LeaveStatus.APPROVED
+            )
+        )
+        leave_requests = leaves_result.scalars().all()
+        leave_map = {}
+        for leave in leave_requests:
+            for i in range((leave.end_date - leave.start_date).days + 1):
+                current_date = leave.start_date + timedelta(days=i)
+                if start_date <= current_date <= end_date:
+                    leave_info = {
+                        'leave_type': leave.leave_type,
+                        'duration_type': leave.duration_type or 'full_day',
+                    }
+                    leave_map[(leave.employee_id, current_date)] = leave_info
+
+        # Create workbook
+        wb = Workbook()
+        summary_ws = wb.active
+        summary_ws.title = "Summary"
+        
+        # Styles
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        emp_header_fill = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")
+        emp_header_font = Font(bold=True, color="FFFFFF", size=10)
+        border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        
+        # Summary Sheet
+        summary_ws['A1'] = f"{department.name} - Monthly Attendance Summary"
+        summary_ws['A1'].font = Font(bold=True, size=14)
+        summary_ws.merge_cells('A1:D1')
+        
+        summary_ws['A2'] = f"{calendar.month_name[month]} {year}"
+        summary_ws['A2'].font = Font(bold=True, size=12)
+        summary_ws.merge_cells('A2:D2')
+        
+        # Department summary stats
+        summary_ws['A4'] = "Report Statistics:"
+        summary_ws['A4'].font = Font(bold=True, size=11)
+        
+        summary_ws['A5'] = "Total Employees"
+        summary_ws['B5'] = len(employees)
+        summary_ws['A6'] = "Total Attendance Records"
+        summary_ws['B6'] = len(attendance_records)
+        summary_ws['A7'] = "Month"
+        summary_ws['B7'] = f"{calendar.month_name[month]} {year}"
+        
+        for row in range(5, 8):
+            summary_ws[f'A{row}'].font = Font(bold=True)
+            summary_ws[f'B{row}'].border = border
+        
+        summary_ws.column_dimensions['A'].width = 25
+        summary_ws.column_dimensions['B'].width = 15
+        summary_ws.column_dimensions['C'].width = 20
+        summary_ws.column_dimensions['D'].width = 20
+
+        # Create Employee Details Sheet with all daily records
+        details_ws = wb.create_sheet("All Employee Details")
+        
+        # Title
+        details_ws['A1'] = f"{department.name} - Complete Monthly Attendance"
+        details_ws['A1'].font = Font(bold=True, size=13)
+        details_ws.merge_cells('A1:M1')
+        
+        details_ws['A2'] = f"{calendar.month_name[month]} {year}"
+        details_ws['A2'].font = Font(bold=True, size=11)
+        details_ws.merge_cells('A2:M2')
+        
+        current_row = 4
+        
+        # Process each employee
+        for employee in employees:
+            # Employee Header with details
+            details_ws[f'A{current_row}'] = "EMPLOYEE DETAILS"
+            details_ws[f'A{current_row}'].fill = emp_header_fill
+            details_ws[f'A{current_row}'].font = emp_header_font
+            details_ws.merge_cells(f'A{current_row}:M{current_row}')
+            current_row += 1
+            
+            # Employee info row
+            emp_info = f"ID: {employee.employee_id} | Name: {employee.first_name} {employee.last_name} | Email: {employee.email} | Phone: {employee.phone or 'N/A'}"
+            details_ws[f'A{current_row}'] = emp_info
+            details_ws[f'A{current_row}'].font = Font(size=10)
+            details_ws.merge_cells(f'A{current_row}:M{current_row}')
+            current_row += 1
+            
+            # Column headers for this employee
+            headers = ['Date', 'Day', 'Shift Time', 'Check-In', 'Check-Out', 'Worked Hours', 'Break Min', 'Overtime', 'Status', 'Leave/Comp-Off', 'Notes']
+            for col, header in enumerate(headers, 1):
+                cell = details_ws.cell(row=current_row, column=col)
+                cell.value = header
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                cell.border = border
+            current_row += 1
+            
+            # Get employee's attendance for the month
+            emp_attendance = [r for r in attendance_records if r.employee_id == employee.id]
+            
+            # Generate all dates and show attendance
+            from dateutil.rrule import rrule, DAILY
+            all_dates = list(rrule(DAILY, dtstart=start_date, until=end_date))
+            
+            for current_date in all_dates:
+                date_obj = current_date.date() if hasattr(current_date, 'date') else current_date
+                day_name = date_obj.strftime('%A')[:3]
+                
+                # Get attendance record for this date
+                att_rec = next((r for r in emp_attendance if r.date == date_obj), None)
+                
+                # Get schedule
+                schedule = schedule_map.get((employee.id, date_obj))
+                
+                # Get leave info
+                leave_info = leave_map.get((employee.id, date_obj))
+                
+                # Get check-in details
+                checkin = checkin_map.get((employee.id, date_obj))
+                
+                # Build leave/comp-off status
+                leave_status = '-'
+                if schedule and schedule.status in ['leave', 'leave_half_morning', 'leave_half_afternoon', 'comp_off_taken']:
+                    if schedule.status == 'leave_half_morning':
+                        leave_status = "LEAVE-AM"
+                    elif schedule.status == 'leave_half_afternoon':
+                        leave_status = "LEAVE-PM"
+                    elif schedule.status == 'comp_off_taken':
+                        leave_status = "COMP-OFF"
+                    else:
+                        leave_status = "LEAVE"
+                elif leave_info:
+                    if 'half' in leave_info['duration_type']:
+                        leave_status = f"{leave_info['leave_type']}-Half"
+                    else:
+                        leave_status = leave_info['leave_type']
+                
+                # Shift time
+                shift_time = '-'
+                if schedule and schedule.start_time and schedule.end_time:
+                    shift_time = f"{schedule.start_time}-{schedule.end_time}"
+                
+                # Check-in/out times
+                check_in_time = '-'
+                check_out_time = '-'
+                if att_rec:
+                    check_in_time = att_rec.in_time or '-'
+                    check_out_time = att_rec.out_time or '-'
+                elif checkin:
+                    check_in_time = checkin.check_in_time.strftime('%H:%M') if checkin.check_in_time else '-'
+                    check_out_time = checkin.check_out_time.strftime('%H:%M') if checkin.check_out_time else '-'
+                
+                # Worked hours
+                worked_hours = '-'
+                if att_rec and att_rec.worked_hours:
+                    worked_hours = f"{att_rec.worked_hours:.2f}"
+                
+                # Break
+                break_mins = '-'
+                if att_rec and att_rec.break_minutes:
+                    break_mins = str(att_rec.break_minutes)
+                
+                # Overtime
+                overtime = '-'
+                if att_rec and att_rec.overtime_hours and att_rec.overtime_hours > 0:
+                    overtime = f"{att_rec.overtime_hours:.2f}"
+                
+                # Status
+                status_val = '-'
+                if att_rec and att_rec.status:
+                    status_val = att_rec.status
+                elif checkin and checkin.check_in_status:
+                    status_val = checkin.check_in_status
+                
+                # Notes
+                notes = att_rec.notes if att_rec and att_rec.notes else ''
+                
+                # Write row
+                details_ws.cell(row=current_row, column=1).value = date_obj.isoformat()
+                details_ws.cell(row=current_row, column=2).value = day_name
+                details_ws.cell(row=current_row, column=3).value = shift_time
+                details_ws.cell(row=current_row, column=4).value = check_in_time
+                details_ws.cell(row=current_row, column=5).value = check_out_time
+                details_ws.cell(row=current_row, column=6).value = worked_hours
+                details_ws.cell(row=current_row, column=7).value = break_mins
+                details_ws.cell(row=current_row, column=8).value = overtime
+                details_ws.cell(row=current_row, column=9).value = status_val
+                details_ws.cell(row=current_row, column=10).value = leave_status
+                details_ws.cell(row=current_row, column=11).value = notes
+                
+                # Apply borders and alignment
+                for col in range(1, 12):
+                    cell = details_ws.cell(row=current_row, column=col)
+                    cell.border = border
+                    cell.alignment = Alignment(horizontal='center' if col != 11 else 'left', vertical='center')
+                
+                current_row += 1
+            
+            # Add summary for this employee
+            current_row += 1
+            
+        # Adjust column widths
+        details_ws.column_dimensions['A'].width = 12
+        details_ws.column_dimensions['B'].width = 5
+        details_ws.column_dimensions['C'].width = 14
+        details_ws.column_dimensions['D'].width = 12
+        details_ws.column_dimensions['E'].width = 12
+        details_ws.column_dimensions['F'].width = 12
+        details_ws.column_dimensions['G'].width = 10
+        details_ws.column_dimensions['H'].width = 10
+        details_ws.column_dimensions['I'].width = 12
+        details_ws.column_dimensions['J'].width = 14
+        details_ws.column_dimensions['K'].width = 20
+        
+        # Save to bytes
+        file_bytes = io.BytesIO()
+        wb.save(file_bytes)
+        file_bytes.seek(0)
+
+        return StreamingResponse(
+            iter([file_bytes.getvalue()]),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={department.name}_complete_attendance_{year}-{month:02d}.xlsx"}
+        )
+    except Exception as e:
+        print(f"Comprehensive export error: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
@@ -2036,37 +2534,37 @@ async def export_weekly_attendance(
         
         # Create workbook
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Weekly"
         
-        # Header styles
+        # Define professional styles (same as monthly)
         header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-        header_font = Font(bold=True, color="FFFFFF")
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        title_font = Font(bold=True, size=14)
+        section_font = Font(bold=True, size=12)
         border = Border(
             left=Side(style='thin'),
             right=Side(style='thin'),
             top=Side(style='thin'),
             bottom=Side(style='thin')
         )
+        center_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        summary_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+        summary_font = Font(bold=True, color="000000")
         
-        # Title
-        ws['A1'] = f"{department.name} - Weekly Attendance Report"
-        ws['A1'].font = Font(bold=True, size=14)
-        ws.merge_cells('A1:M1')
-
-        ws['A2'] = f"{start_date.isoformat()} to {end_date.isoformat()}"
-        ws.merge_cells('A2:M2')
-
-        # Headers - Added Comp-Off columns
-        headers = ['Employee ID', 'Name', 'Date', 'Assigned Shift', 'Total Hrs Assigned', 'Check-In', 'Check-Out', 'Total Hrs Worked', 'Break Time', 'Overtime Hours', 'Status', 'Comp-Off Earned', 'Comp-Off Used']
-        for col, header in enumerate(headers, 1):
-            cell = ws.cell(row=4, column=col)
-            cell.value = header
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal='center', vertical='center')
-            cell.border = border
-
+        # Create Summary Sheet First
+        summary_ws = wb.active
+        summary_ws.title = "Summary"
+        
+        # Summary Title
+        summary_ws['A1'] = f"{department.name} - Weekly Attendance Summary"
+        summary_ws['A1'].font = title_font
+        summary_ws.merge_cells('A1:B1')
+        
+        summary_ws['A2'] = f"{start_date.isoformat()} to {end_date.isoformat()}"
+        summary_ws['A2'].font = Font(size=11)
+        summary_ws.merge_cells('A2:B2')
+        
+        summary_ws['A3'] = ""
+        
         # Get schedules for shift information
         sched_result = await db.execute(
             select(Schedule).filter(
@@ -2098,6 +2596,73 @@ async def export_weekly_attendance(
         for detail in compoff_details:
             detail_date = detail.date.date() if hasattr(detail.date, 'date') else detail.date
             comp_off_used_map[(detail.employee_id, detail_date)] = True
+        
+        # Calculate totals from attendance records for summary
+        total_worked_hours = 0
+        total_overtime_hours = 0
+        present_count = 0
+        
+        for record in attendance_records:
+            if record.worked_hours and record.worked_hours > 0:
+                total_worked_hours += record.worked_hours
+                present_count += 1
+            if record.overtime_hours:
+                total_overtime_hours += record.overtime_hours
+        
+        # Summary data with styling
+        summary_ws['A4'] = "WEEKLY STATISTICS"
+        summary_ws['A4'].font = section_font
+        summary_ws['A4'].fill = summary_fill
+        summary_ws['A4'].border = border
+        summary_ws['B4'].fill = summary_fill
+        summary_ws['B4'].border = border
+        
+        summary_data = [
+            ['Total Employees in Department', len(employees)],
+            ['Employees Present (with attendance)', present_count],
+            ['Total Working Hours (All Employees)', f'{total_worked_hours:.2f}'],
+            ['Total Overtime Hours (All Employees)', f'{total_overtime_hours:.2f}'],
+        ]
+        
+        row = 5
+        for label, value in summary_data:
+            summary_ws[f'A{row}'] = label
+            summary_ws[f'B{row}'] = value
+            summary_ws[f'A{row}'].font = summary_font
+            summary_ws[f'A{row}'].fill = summary_fill
+            summary_ws[f'A{row}'].border = border
+            summary_ws[f'B{row}'].border = border
+            summary_ws[f'B{row}'].alignment = Alignment(horizontal='right')
+            row += 1
+        
+        # Adjust column widths for summary
+        summary_ws.column_dimensions['A'].width = 35
+        summary_ws.column_dimensions['B'].width = 20
+        
+        # Create Attendance Details Sheet
+        ws = wb.create_sheet("Attendance Details")
+        ws.title = "Attendance Details"
+        
+        # Title and Info
+        ws['A1'] = f"{department.name} - Weekly Attendance Report"
+        ws['A1'].font = title_font
+        ws.merge_cells('A1:M1')
+
+        ws['A2'] = f"{start_date.isoformat()} to {end_date.isoformat()} | Total Employees: {len(employees)}"
+        ws['A2'].font = Font(size=11)
+        ws.merge_cells('A2:M2')
+
+        ws['A3'] = ""
+        
+        # Headers - Added Comp-Off columns
+        headers = ['Employee ID', 'Name', 'Date', 'Assigned Shift', 'Total Hrs Assigned', 'Check-In', 'Check-Out', 'Total Hrs Worked', 'Break Time', 'Overtime Hours', 'Status', 'Comp-Off Earned', 'Comp-Off Used']
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=4, column=col)
+            cell.value = header
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+            cell.border = border
         
         # Data
         row = 5
@@ -2136,24 +2701,35 @@ async def export_weekly_attendance(
                 ws.cell(row=row, column=11).value = record.status or '-'
                 ws.cell(row=row, column=12).value = comp_off_earned_str
                 ws.cell(row=row, column=13).value = comp_off_used_str
+                
+                # Apply borders and alignment to all cells
                 for col in range(1, 14):
-                    ws.cell(row=row, column=col).border = border
+                    cell = ws.cell(row=row, column=col)
+                    cell.border = border
+                    cell.alignment = Alignment(horizontal='center', vertical='center') if col in [1, 3, 6, 7, 8, 9, 10, 11, 12, 13] else Alignment(horizontal='left', vertical='center')
+                    # Alternate row colors for better readability
+                    if row % 2 == 0:
+                        cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+                
                 row += 1
 
-        # Adjust column widths
-        ws.column_dimensions['A'].width = 12
-        ws.column_dimensions['B'].width = 20
-        ws.column_dimensions['C'].width = 12
-        ws.column_dimensions['D'].width = 18
-        ws.column_dimensions['E'].width = 16
-        ws.column_dimensions['F'].width = 12
-        ws.column_dimensions['G'].width = 12
-        ws.column_dimensions['H'].width = 14
-        ws.column_dimensions['I'].width = 12
-        ws.column_dimensions['J'].width = 15
-        ws.column_dimensions['K'].width = 12
-        ws.column_dimensions['L'].width = 14
-        ws.column_dimensions['M'].width = 14
+        # Adjust column widths for better readability
+        ws.column_dimensions['A'].width = 13  # Employee ID
+        ws.column_dimensions['B'].width = 22  # Name
+        ws.column_dimensions['C'].width = 14  # Date
+        ws.column_dimensions['D'].width = 18  # Assigned Shift
+        ws.column_dimensions['E'].width = 16  # Total Hrs Assigned
+        ws.column_dimensions['F'].width = 12  # Check-In
+        ws.column_dimensions['G'].width = 12  # Check-Out
+        ws.column_dimensions['H'].width = 16  # Total Hrs Worked
+        ws.column_dimensions['I'].width = 12  # Break Time
+        ws.column_dimensions['J'].width = 16  # Overtime Hours
+        ws.column_dimensions['K'].width = 12  # Status
+        ws.column_dimensions['L'].width = 15  # Comp-Off Earned
+        ws.column_dimensions['M'].width = 15  # Comp-Off Used
+
+        # Set Summary as the active sheet so it shows first
+        wb.active = wb['Summary']
 
         # Save to bytes
         file_bytes = io.BytesIO()
@@ -2280,45 +2856,208 @@ async def export_employee_monthly_attendance(
                 leave_dates.add(current)
                 current += timedelta(days=1)
         
-        # Create workbook
+        # Create workbook with multiple sheets
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Monthly Attendance"
+        wb.remove(wb.active)  # Remove default sheet
         
-        # Header styles
+        # Define professional styles
         header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-        header_font = Font(bold=True, color="FFFFFF")
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        title_font = Font(bold=True, size=14)
+        section_font = Font(bold=True, size=12)
         border = Border(
             left=Side(style='thin'),
             right=Side(style='thin'),
             top=Side(style='thin'),
             bottom=Side(style='thin')
         )
-        summary_fill = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
-        summary_font = Font(bold=True)
+        center_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        summary_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+        summary_font = Font(bold=True, color="000000")
+        
+        # === SHEET 1: SUMMARY ===
+        summary_sheet = wb.create_sheet("Summary")
         
         # Title
-        ws['A1'] = f"{employee.first_name} {employee.last_name} - Monthly Attendance Report"
-        ws['A1'].font = Font(bold=True, size=14)
-        ws.merge_cells('A1:J1')
+        summary_sheet['A1'] = f"{employee.first_name} {employee.last_name} - Monthly Report"
+        summary_sheet['A1'].font = title_font
+        summary_sheet.merge_cells('A1:B1')
+        
+        summary_sheet['A2'] = f"{calendar.month_name[month]} {year}"
+        summary_sheet['A2'].font = Font(size=11)
+        summary_sheet.merge_cells('A2:B2')
+        
+        summary_sheet['A3'] = f"Employee ID: {employee.employee_id}"
+        summary_sheet['A3'].font = Font(size=10)
+        
+        summary_sheet['A4'] = ""
+        
+        # Calculate statistics
+        from dateutil.rrule import rrule, DAILY
+        all_dates = list(rrule(DAILY, dtstart=start_date, until=end_date))
+        
+        # Get public holidays
+        from app.holidays_jp import JapaneseCalendar
+        jp_calendar = JapaneseCalendar()
+        jp_holidays_dict = jp_calendar.get_holidays_in_range(start_date, end_date)
+        
+        # Count statistics
+        total_days_in_month = len(all_dates)
+        public_holidays = len(jp_holidays_dict)
+        weekends = 0
+        working_days_available = 0
+        
+        for current_date in all_dates:
+            date_obj = current_date.date() if hasattr(current_date, 'date') else current_date
+            is_weekend = date_obj.weekday() >= 5
+            is_public_holiday = date_obj in jp_holidays_dict
+            
+            if is_weekend and not is_public_holiday:
+                weekends += 1
+            elif not is_public_holiday and not is_weekend:
+                working_days_available += 1
+        
+        # Count leave types
+        paid_leave_days = 0
+        unpaid_leave_days = 0
+        
+        for leave in leave_records:
+            days = (leave.end_date - leave.start_date).days + 1
+            if leave.duration_type and leave.duration_type.startswith('half_day'):
+                days = 0.5
+            
+            if leave.leave_type.lower() == 'paid':
+                paid_leave_days += days
+            else:
+                unpaid_leave_days += days
+        
+        # Count worked hours
+        total_worked_hours = 0
+        total_ot_hours = 0
+        working_days_worked = 0
+        
+        for record in attendance_records:
+            if record.worked_hours and record.worked_hours > 0:
+                total_worked_hours += record.worked_hours
+                working_days_worked += 1
+            if record.overtime_hours:
+                total_ot_hours += record.overtime_hours
+        
+        # Summary sections
+        row = 5
+        
+        # ATTENDANCE SUMMARY
+        summary_sheet[f'A{row}'] = "ATTENDANCE SUMMARY"
+        summary_sheet[f'A{row}'].font = section_font
+        summary_sheet[f'A{row}'].fill = summary_fill
+        summary_sheet[f'A{row}'].border = border
+        summary_sheet[f'B{row}'].fill = summary_fill
+        summary_sheet[f'B{row}'].border = border
+        summary_sheet.merge_cells(f'A{row}:B{row}')
+        
+        row += 1
+        attendance_items = [
+            ('Total Days in Month', total_days_in_month),
+            ('Public Holidays', public_holidays),
+            ('Weekends', weekends),
+            ('Total Non-Working Days', public_holidays + weekends),
+            ('Working Days Available', working_days_available),
+            ('Working Days Worked', working_days_worked),
+        ]
+        
+        for label, value in attendance_items:
+            summary_sheet[f'A{row}'] = label
+            summary_sheet[f'B{row}'] = value
+            summary_sheet[f'A{row}'].font = summary_font
+            summary_sheet[f'A{row}'].fill = summary_fill
+            summary_sheet[f'A{row}'].border = border
+            summary_sheet[f'B{row}'].border = border
+            summary_sheet[f'B{row}'].alignment = Alignment(horizontal='right')
+            row += 1
+        
+        # LEAVE SUMMARY
+        row += 1
+        summary_sheet[f'A{row}'] = "LEAVE SUMMARY"
+        summary_sheet[f'A{row}'].font = section_font
+        summary_sheet[f'A{row}'].fill = summary_fill
+        summary_sheet[f'A{row}'].border = border
+        summary_sheet[f'B{row}'].fill = summary_fill
+        summary_sheet[f'B{row}'].border = border
+        summary_sheet.merge_cells(f'A{row}:B{row}')
+        
+        row += 1
+        leave_items = [
+            ('Paid Leave Days', f'{paid_leave_days:.1f}'),
+            ('Unpaid Leave Days', f'{unpaid_leave_days:.1f}'),
+            ('Total Leave Days', f'{paid_leave_days + unpaid_leave_days:.1f}'),
+        ]
+        
+        for label, value in leave_items:
+            summary_sheet[f'A{row}'] = label
+            summary_sheet[f'B{row}'] = value
+            summary_sheet[f'A{row}'].font = summary_font
+            summary_sheet[f'A{row}'].fill = summary_fill
+            summary_sheet[f'A{row}'].border = border
+            summary_sheet[f'B{row}'].border = border
+            summary_sheet[f'B{row}'].alignment = Alignment(horizontal='right')
+            row += 1
+        
+        # HOURS SUMMARY
+        row += 1
+        summary_sheet[f'A{row}'] = "HOURS SUMMARY"
+        summary_sheet[f'A{row}'].font = section_font
+        summary_sheet[f'A{row}'].fill = summary_fill
+        summary_sheet[f'A{row}'].border = border
+        summary_sheet[f'B{row}'].fill = summary_fill
+        summary_sheet[f'B{row}'].border = border
+        summary_sheet.merge_cells(f'A{row}:B{row}')
+        
+        row += 1
+        hours_items = [
+            ('Total Hours Worked', f'{total_worked_hours:.2f}'),
+            ('Total Overtime Hours', f'{total_ot_hours:.2f}'),
+        ]
+        
+        for label, value in hours_items:
+            summary_sheet[f'A{row}'] = label
+            summary_sheet[f'B{row}'] = value
+            summary_sheet[f'A{row}'].font = summary_font
+            summary_sheet[f'A{row}'].fill = summary_fill
+            summary_sheet[f'A{row}'].border = border
+            summary_sheet[f'B{row}'].border = border
+            summary_sheet[f'B{row}'].alignment = Alignment(horizontal='right')
+            row += 1
+        
+        summary_sheet.column_dimensions['A'].width = 30
+        summary_sheet.column_dimensions['B'].width = 20
+        
+        # === SHEET 2: DAILY ATTENDANCE ===
+        ws = wb.create_sheet("Daily Attendance")
+        ws.title = "Daily Attendance"
+        
+        # Title
+        ws['A1'] = f"{employee.first_name} {employee.last_name} - Daily Attendance"
+        ws['A1'].font = title_font
+        ws.merge_cells('A1:L1')
         
         ws['A2'] = f"{calendar.month_name[month]} {year}"
-        ws.merge_cells('A2:J2')
+        ws['A2'].font = Font(size=11)
+        ws.merge_cells('A2:L2')
         
-        ws['A3'] = f"Employee ID: {employee.employee_id}"
+        ws['A3'] = ""
         
-        # Headers - updated to include comp-off columns
+        # Headers
         headers = ['Date', 'Day', 'Assigned Shift', 'Check-In', 'Check-Out', 'Hours Worked', 'Break (min)', 'Overtime Hours', 'Status', 'Comp-Off Earned', 'Comp-Off Used', 'Notes']
         for col, header in enumerate(headers, 1):
-            cell = ws.cell(row=5, column=col)
+            cell = ws.cell(row=4, column=col)
             cell.value = header
             cell.fill = header_fill
             cell.font = header_font
-            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.alignment = center_alignment
             cell.border = border
         
         # Data
-        row = 6
+        row = 5
         total_worked_hours = 0
         total_ot_hours = 0
         working_days_count = 0
@@ -2350,8 +3089,14 @@ async def export_employee_monthly_attendance(
             ws.cell(row=row, column=11).value = comp_off_used_str
             ws.cell(row=row, column=12).value = record.notes or '-'
             
+            # Apply styling
             for col in range(1, 13):
-                ws.cell(row=row, column=col).border = border
+                cell = ws.cell(row=row, column=col)
+                cell.border = border
+                cell.alignment = center_alignment if col in [1, 2, 9, 10, 11] else Alignment(horizontal='left', vertical='center')
+                # Alternate row colors
+                if row % 2 == 0:
+                    cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
             
             if record.worked_hours and record.worked_hours > 0:
                 total_worked_hours += record.worked_hours
@@ -2367,49 +3112,22 @@ async def export_employee_monthly_attendance(
             
             row += 1
         
-        # Summary section
-        summary_row = row + 2
-        
-        ws.cell(row=summary_row, column=1).value = "SUMMARY"
-        ws.cell(row=summary_row, column=1).font = Font(bold=True, size=12)
-        
-        summary_row += 1
-        
-        # Summary items - now including comp-off
-        summary_items = [
-            ("Working Days Worked", working_days_count),
-            ("Leave Days Taken", len(leave_dates)),
-            ("Comp-Off Days Earned", comp_off_earned_count),
-            ("Comp-Off Days Used", comp_off_used_count),
-            ("Total Hours Worked", f"{total_worked_hours:.2f}"),
-            ("Total OT Hours", f"{total_ot_hours:.2f}"),
-        ]
-        
-        for label, value in summary_items:
-            ws.cell(row=summary_row, column=1).value = label
-            ws.cell(row=summary_row, column=1).font = summary_font
-            ws.cell(row=summary_row, column=1).fill = summary_fill
-            ws.cell(row=summary_row, column=1).border = border
-            
-            ws.cell(row=summary_row, column=2).value = value
-            ws.cell(row=summary_row, column=2).fill = summary_fill
-            ws.cell(row=summary_row, column=2).border = border
-            
-            summary_row += 1
-        
         # Adjust column widths
-        ws.column_dimensions['A'].width = 12
-        ws.column_dimensions['B'].width = 12
-        ws.column_dimensions['C'].width = 16
+        ws.column_dimensions['A'].width = 14
+        ws.column_dimensions['B'].width = 14
+        ws.column_dimensions['C'].width = 18
         ws.column_dimensions['D'].width = 12
         ws.column_dimensions['E'].width = 12
         ws.column_dimensions['F'].width = 14
         ws.column_dimensions['G'].width = 12
-        ws.column_dimensions['H'].width = 15
+        ws.column_dimensions['H'].width = 16
         ws.column_dimensions['I'].width = 12
-        ws.column_dimensions['J'].width = 14
-        ws.column_dimensions['K'].width = 14
+        ws.column_dimensions['J'].width = 15
+        ws.column_dimensions['K'].width = 15
         ws.column_dimensions['L'].width = 20
+        
+        # Set Summary as the active sheet
+        wb.active = summary_sheet
         
         # Save to bytes
         file_bytes = io.BytesIO()
@@ -2426,19 +3144,6 @@ async def export_employee_monthly_attendance(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
-    ws.column_dimensions['E'].width = 12
-    ws.column_dimensions['F'].width = 12
-    
-    # Save to bytes
-    file_bytes = io.BytesIO()
-    wb.save(file_bytes)
-    file_bytes.seek(0)
-    
-    return StreamingResponse(
-        iter([file_bytes.getvalue()]),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={department.name}_attendance_{start_date.isoformat()}_to_{end_date.isoformat()}.xlsx"}
-    )
 
 
 # Leave Requests
@@ -2992,6 +3697,135 @@ async def export_leave_compoff_report(
     ws_compoff.column_dimensions['F'].width = 10
     ws_compoff.column_dimensions['G'].width = 10
     
+    # === SHEET 3: Attendance Summary ===
+    ws_attendance = wb.create_sheet("Attendance Summary")
+    
+    # Get recent 3 months of attendance data
+    from datetime import timedelta
+    today = date.today()
+    three_months_ago = today - timedelta(days=90)
+    
+    att_result = await db.execute(
+        select(Attendance)
+        .filter(
+            Attendance.employee_id == employee.id,
+            Attendance.date >= three_months_ago,
+            Attendance.date <= today
+        )
+        .order_by(Attendance.date.desc())
+    )
+    attendance_records = att_result.scalars().all()
+    
+    # Get schedules for shift info
+    sched_result = await db.execute(
+        select(Schedule)
+        .filter(
+            Schedule.employee_id == employee.id,
+            Schedule.date >= three_months_ago,
+            Schedule.date <= today
+        )
+        .order_by(Schedule.date.desc())
+    )
+    schedules = sched_result.scalars().all()
+    schedule_map = {s.date: s for s in schedules}
+    
+    # Title
+    ws_attendance['A1'] = f"Attendance Summary - {employee.first_name} {employee.last_name}"
+    ws_attendance['A1'].font = Font(bold=True, size=14)
+    ws_attendance.merge_cells('A1:H1')
+    
+    ws_attendance['A2'] = f"Employee ID: {employee.employee_id}"
+    ws_attendance['A3'] = f"Period: Last 90 Days | Generated on: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+    
+    # Headers
+    headers_att = ['Date', 'Day', 'Shift Time', 'Check-In', 'Check-Out', 'Hours Worked', 'Overtime Hours', 'Status']
+    for col, header in enumerate(headers_att, 1):
+        cell = ws_attendance.cell(row=5, column=col)
+        cell.value = header
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center')
+    
+    # Data - attendance records
+    row = 6
+    total_ot_hours = 0
+    total_work_hours = 0
+    
+    for att_rec in attendance_records:
+        schedule = schedule_map.get(att_rec.date)
+        shift_str = '-'
+        if schedule and schedule.start_time and schedule.end_time:
+            shift_str = f"{schedule.start_time} - {schedule.end_time}"
+        
+        # Calculate hours worked
+        hours_worked = '-'
+        if att_rec.in_time and att_rec.out_time:
+            try:
+                in_h, in_m = map(int, str(att_rec.in_time).split(':')[:2])
+                out_h, out_m = map(int, str(att_rec.out_time).split(':')[:2])
+                in_decimal = in_h + in_m / 60
+                out_decimal = out_h + out_m / 60
+                hours = out_decimal - in_decimal if out_decimal > in_decimal else 24 - in_decimal + out_decimal
+                hours_worked = f"{hours:.2f}"
+                total_work_hours += hours
+            except:
+                pass
+        
+        ot_hours = att_rec.overtime_hours or 0
+        total_ot_hours += ot_hours
+        
+        # Get day name
+        day_name = att_rec.date.strftime('%A')
+        
+        ws_attendance.cell(row=row, column=1).value = att_rec.date.isoformat()
+        ws_attendance.cell(row=row, column=2).value = day_name
+        ws_attendance.cell(row=row, column=3).value = shift_str
+        ws_attendance.cell(row=row, column=4).value = att_rec.in_time or '-'
+        ws_attendance.cell(row=row, column=5).value = att_rec.out_time or '-'
+        ws_attendance.cell(row=row, column=6).value = hours_worked
+        ws_attendance.cell(row=row, column=7).value = f"{ot_hours:.2f}" if ot_hours > 0 else '-'
+        ws_attendance.cell(row=row, column=8).value = 'Present'
+        
+        for col in range(1, 9):
+            ws_attendance.cell(row=row, column=col).border = border
+        
+        row += 1
+    
+    # Summary stats
+    summary_row = row + 2
+    ws_attendance.cell(row=summary_row, column=1).value = "ATTENDANCE SUMMARY"
+    ws_attendance.cell(row=summary_row, column=1).font = Font(bold=True, size=12)
+    
+    summary_row += 1
+    summary_items_att = [
+        ("Total Days Worked", len(attendance_records)),
+        ("Total Work Hours", f"{total_work_hours:.2f}"),
+        ("Total Overtime Hours", f"{total_ot_hours:.2f}"),
+    ]
+    
+    for label, value in summary_items_att:
+        ws_attendance.cell(row=summary_row, column=1).value = label
+        ws_attendance.cell(row=summary_row, column=1).font = summary_font
+        ws_attendance.cell(row=summary_row, column=1).fill = summary_fill
+        ws_attendance.cell(row=summary_row, column=1).border = border
+        
+        ws_attendance.cell(row=summary_row, column=2).value = value
+        ws_attendance.cell(row=summary_row, column=2).fill = summary_fill
+        ws_attendance.cell(row=summary_row, column=2).border = border
+        
+        summary_row += 1
+    
+    # Adjust widths
+    ws_attendance.column_dimensions['A'].width = 14
+    ws_attendance.column_dimensions['B'].width = 12
+    ws_attendance.column_dimensions['C'].width = 16
+    ws_attendance.column_dimensions['D'].width = 12
+    ws_attendance.column_dimensions['E'].width = 12
+    ws_attendance.column_dimensions['F'].width = 14
+    ws_attendance.column_dimensions['G'].width = 16
+    ws_attendance.column_dimensions['H'].width = 12
+    
     # Save to bytes
     file_bytes = io.BytesIO()
     wb.save(file_bytes)
@@ -3103,19 +3937,11 @@ async def approve_leave(
 
             current_check_date += timedelta(days=1)
 
-        # ===== CONSTRAINT VALIDATION for comp-off usage =====
-        # Validate 5-shifts-per-week and consecutive-shifts constraints for each comp-off day
-        validation_date = leave_request.start_date
-        while validation_date <= leave_request.end_date:
-            is_valid, error_msg = await validate_5_shifts_per_week(employee.id, validation_date, db)
-            if not is_valid:
-                raise HTTPException(status_code=400, detail=f"Cannot approve comp-off: {error_msg}")
-            
-            is_valid, error_msg = await validate_consecutive_shifts_limit(employee.id, validation_date, db)
-            if not is_valid:
-                raise HTTPException(status_code=400, detail=f"Cannot approve comp-off: {error_msg}")
-            
-            validation_date += timedelta(days=1)
+        # ===== NO CONSTRAINT VALIDATION for comp-off usage =====
+        # comp_off_taken is NOT a work shift - it replaces a scheduled shift
+        # Therefore it does NOT count toward 5-shifts-per-week limit
+        # No validation needed - just create the comp-off schedule
+        print(f"[DEBUG] ✓ Creating comp-off_taken schedule (no constraint validation needed)", flush=True)
 
         # Create schedule entry for each day of comp-off
         current_date = leave_request.start_date
@@ -3264,21 +4090,24 @@ async def create_comp_off_request(
         target_employee_id = employee.id
         manager_id = None
 
-    # Check if a shift is already assigned on that date
+    # Check if a WORK SHIFT is already assigned on that date (not leaves or comp-off)
     shift_result = await db.execute(
         select(Schedule).filter(
             Schedule.employee_id == target_employee_id,
             Schedule.date == comp_off_data.comp_off_date,
-            Schedule.status != 'cancelled'
+            Schedule.status.in_(['scheduled', 'completed'])  # Only actual work shifts block comp-off
         )
     )
     existing_shift = shift_result.scalar_one_or_none()
 
     if existing_shift:
+        print(f"[DEBUG] ✗ Comp-off blocked: {target_employee_id} has shift on {comp_off_data.comp_off_date} with status '{existing_shift.status}'", flush=True)
         raise HTTPException(
             status_code=400,
-            detail="Shift already assigned on this date. Cannot apply comp-off when a shift is scheduled."
+            detail=f"Shift already assigned on this date. Cannot apply comp-off when a work shift is scheduled."
         )
+
+    print(f"[DEBUG] ✓ Comp-off allowed: {target_employee_id} has no shift on {comp_off_data.comp_off_date}", flush=True)
 
     # Create comp-off request (pending approval for employees, can be auto-approved for managers)
     comp_off_request = CompOffRequest(
@@ -3303,7 +4132,7 @@ async def list_comp_off_requests(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """List comp-off requests"""
+    """List comp-off requests - employees see their own, managers see their department's"""
     if current_user.user_type == UserType.EMPLOYEE:
         # Employees see only their own requests
         emp_result = await db.execute(
@@ -3320,8 +4149,26 @@ async def list_comp_off_requests(
             .filter(CompOffRequest.employee_id == employee.id)
             .order_by(CompOffRequest.comp_off_date.desc())
         )
+    elif current_user.user_type == UserType.MANAGER:
+        # Managers see comp-off requests from employees in their department only
+        manager_result = await db.execute(
+            select(Manager).filter(Manager.user_id == current_user.id)
+        )
+        manager = manager_result.scalar_one_or_none()
+
+        if not manager:
+            return []
+
+        # Get all comp-off requests from employees in this manager's department
+        result = await db.execute(
+            select(CompOffRequest)
+            .options(selectinload(CompOffRequest.employee))
+            .join(Employee, CompOffRequest.employee_id == Employee.id)
+            .filter(Employee.department_id == manager.department_id)
+            .order_by(CompOffRequest.comp_off_date.desc())
+        )
     else:
-        # Managers/Admins see all requests
+        # Admins see all requests
         result = await db.execute(
             select(CompOffRequest)
             .options(selectinload(CompOffRequest.employee))
@@ -3565,118 +4412,27 @@ async def approve_comp_off(
     comp_off.reviewed_at = datetime.utcnow()
     comp_off.review_notes = approval_data.review_notes
     
-    # Get a shift for the employee's role to use for the comp-off day
-    # Priority 1: Check what day of week the comp-off is
-    comp_off_day_name = comp_off.comp_off_date.strftime('%A')  # e.g., 'Monday', 'Friday'
+    print(f"[DEBUG] ✓ Approving comp-off for {employee.first_name} on {comp_off.comp_off_date}", flush=True)
     
-    # Priority 2: Try to get shift times from same week (Mon-Fri) to match their typical shift
-    week_start = comp_off.comp_off_date - timedelta(days=comp_off.comp_off_date.weekday())
-    week_end = week_start + timedelta(days=6)
+    # For comp-off taken: no need to find shift times, just create comp_off_taken schedule
+    # (comp_off_taken replaces the scheduled shift, no actual work hours)
     
-    shift_id = None
-    start_time = None
-    end_time = None
-    
-    # Try to find a shift from the same week first
-    week_shift_result = await db.execute(
-        select(Schedule)
-        .filter(
-            Schedule.employee_id == employee.id,
-            Schedule.date >= week_start,
-            Schedule.date <= week_end,
-            Schedule.date != comp_off.comp_off_date,  # Exclude the comp-off date itself
-            Schedule.status.in_(['scheduled', 'completed', 'comp_off_earned'])  # Only work shifts
-        )
-        .order_by(Schedule.date)  # Get any weekday shift from this week
-        .limit(1)
-    )
-    week_schedule = week_shift_result.scalar_one_or_none()
-    
-    if week_schedule and week_schedule.start_time and week_schedule.end_time:
-        shift_id = week_schedule.shift_id
-        start_time = week_schedule.start_time
-        end_time = week_schedule.end_time
-        print(f"[DEBUG] ✓ Found week shift from {week_schedule.date} ({start_time}-{end_time}) for comp-off on {comp_off.comp_off_date}", flush=True)
-    
-    # Fallback: Get shift for the same day of week from previous weeks
-    if not start_time or not end_time:
-        same_day_result = await db.execute(
-            select(Schedule)
-            .filter(
-                Schedule.employee_id == employee.id,
-                func.to_char(Schedule.date, 'Day').ilike(f'%{comp_off_day_name}%'),
-                Schedule.status.in_(['scheduled', 'completed', 'comp_off_earned'])
-            )
-            .order_by(Schedule.date.desc())
-            .limit(1)
-        )
-        same_day_schedule = same_day_result.scalar_one_or_none()
-        
-        if same_day_schedule and same_day_schedule.start_time and same_day_schedule.end_time:
-            shift_id = same_day_schedule.shift_id
-            start_time = same_day_schedule.start_time
-            end_time = same_day_schedule.end_time
-            print(f"[DEBUG] ✓ Found same-day ({comp_off_day_name}) shift from {same_day_schedule.date} ({start_time}-{end_time}) for comp-off on {comp_off.comp_off_date}", flush=True)
-    
-    # Fallback: Get most recent shift
-    if not start_time or not end_time:
-        recent_shift_result = await db.execute(
-            select(Schedule)
-            .filter(
-                Schedule.employee_id == employee.id,
-                Schedule.status.in_(['scheduled', 'completed', 'comp_off_earned'])
-            )
-            .order_by(Schedule.date.desc())
-            .limit(1)
-        )
-        recent_schedule = recent_shift_result.scalar_one_or_none()
-        
-        if recent_schedule and recent_schedule.start_time and recent_schedule.end_time:
-            shift_id = recent_schedule.shift_id
-            start_time = recent_schedule.start_time
-            end_time = recent_schedule.end_time
-            print(f"[DEBUG] ✓ Found recent shift from {recent_schedule.date} ({start_time}-{end_time}) for comp-off on {comp_off.comp_off_date}", flush=True)
-    
-    # Fallback: Get first shift for employee's role
-    if not start_time or not end_time:
-        shift_result = await db.execute(
-            select(Shift)
-            .filter(Shift.role_id == employee.role_id)
-            .limit(1)
-        )
-        shift = shift_result.scalar_one_or_none()
-        if shift and shift.start_time and shift.end_time:
-            shift_id = shift.id
-            start_time = shift.start_time
-            end_time = shift.end_time
-            print(f"[DEBUG] ✓ Using role default shift ({start_time}-{end_time}) for comp-off on {comp_off.comp_off_date}", flush=True)
-    
-    # Fallback to safe defaults
-    if not start_time or not end_time:
-        start_time = "09:00"
-        end_time = "18:00"
-        print(f"[DEBUG] Using default times ({start_time}-{end_time}) for comp-off on {comp_off.comp_off_date}", flush=True)
-    
-    # ===== CONSTRAINT VALIDATION for comp-off earned =====
+    # ===== CONSTRAINT VALIDATION for comp-off taken =====
     # Validate 5-shifts-per-week and consecutive-shifts constraints
-    is_valid, error_msg = await validate_5_shifts_per_week(employee.id, comp_off.comp_off_date, db)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=f"Cannot approve comp-off: {error_msg}")
-    
-    is_valid, error_msg = await validate_consecutive_shifts_limit(employee.id, comp_off.comp_off_date, db)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=f"Cannot approve comp-off: {error_msg}")
+    # These constraints should NOT apply to comp-off_taken since it replaces a shift
+    # and doesn't add to the workload
     
     # Create a schedule entry for the comp-off day
+    # Status: comp_off_taken means employee is using earned comp-off instead of working
     new_schedule = Schedule(
         department_id=employee.department_id,
         employee_id=employee.id,
         role_id=employee.role_id,
-        shift_id=shift_id,
+        shift_id=None,  # No actual shift since using comp-off
         date=comp_off.comp_off_date,
-        start_time=start_time,
-        end_time=end_time,
-        status="comp_off_earned",  # Status for comp-off earned (worked on non-shift day)
+        start_time=None,  # No shift times for comp-off taken
+        end_time=None,
+        status="comp_off_taken",  # Status: using comp-off instead of working
         notes=f"Comp-Off Earned: {comp_off.reason or 'Worked on non-shift day'}"
     )
     
@@ -4120,6 +4876,162 @@ async def delete_notification(
 
 
 # Schedules
+@app.get("/calendar/holidays")
+async def get_holidays(
+    year: int,
+    month: int
+):
+    """Get Japanese holidays for a specific month (public endpoint)"""
+    from calendar import monthrange
+    
+    # Get the calendar days for the month
+    _, days_in_month = monthrange(year, month)
+    start_date = date(year, month, 1)
+    end_date = date(year, month, days_in_month)
+    
+    # Get all holidays and weekends
+    holidays = {}
+    current_date = start_date
+    
+    while current_date <= end_date:
+        is_weekend = current_date.weekday() >= 5  # Saturday=5, Sunday=6
+        is_holiday = is_japanese_holiday(current_date)
+        holiday_name = get_japanese_holiday_name(current_date) if is_holiday else None
+        
+        if is_weekend or is_holiday:
+            holidays[current_date.isoformat()] = {
+                'date': current_date.isoformat(),
+                'day_name': current_date.strftime('%A'),
+                'is_weekend': is_weekend,
+                'is_holiday': is_holiday,
+                'holiday_name': holiday_name,
+                'type': 'holiday' if is_holiday else 'weekend'
+            }
+        
+        current_date += timedelta(days=1)
+    
+    return {
+        'year': year,
+        'month': month,
+        'holidays': holidays
+    }
+
+
+@app.get("/calendar/week-validation/{employee_id}")
+async def check_week_validation(
+    employee_id: int,
+    year: int,
+    month: int,
+    week: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get detailed week validation information for an employee
+    
+    Shows:
+    - Required shifts for the week (based on holidays)
+    - Current shifts assigned
+    - Remaining capacity
+    - Holiday information
+    """
+    from calendar import monthrange
+    
+    # Calculate week start
+    jan_1 = date(year, 1, 1)
+    week_start = jan_1 + timedelta(weeks=week - 1)
+    # Adjust to Monday
+    days_to_monday = week_start.weekday()
+    week_start = week_start - timedelta(days=days_to_monday)
+    week_end = week_start + timedelta(days=6)
+    
+    # Get week info with holidays
+    week_info = jp_calendar.get_week_info(week_start)
+    
+    # Get current shifts for this week
+    shift_result = await db.execute(
+        select(Schedule)
+        .filter(
+            Schedule.employee_id == employee_id,
+            Schedule.date >= week_start,
+            Schedule.date <= week_end,
+            Schedule.status.in_(['scheduled', 'leave', 'comp_off_taken', 'comp_off_earned', 'leave_half_morning', 'leave_half_afternoon'])
+        )
+        .order_by(Schedule.date)
+    )
+    current_shifts = shift_result.scalars().all()
+    
+    required_shifts = week_info['required_shifts']
+    current_shift_count = len(current_shifts)
+    can_add_shifts = required_shifts - current_shift_count
+    
+    return {
+        'week_start': week_start.isoformat(),
+        'week_end': week_end.isoformat(),
+        'required_shifts': required_shifts,
+        'current_shifts': current_shift_count,
+        'remaining_capacity': max(0, can_add_shifts),
+        'is_full': current_shift_count >= required_shifts,
+        'can_add_more': can_add_shifts > 0,
+        'weekday_holidays': [
+            {
+                'date': day['date'].isoformat(),
+                'day_name': day['day_name'],
+                'holiday_name': day['holiday_name']
+            }
+            for day in week_info['days']
+            if day['is_holiday'] and not day['is_weekend']
+        ],
+        'holidays_note': f"This week has {week_info['weekday_holiday_count']} weekday holiday(s), so only {required_shifts} shifts required",
+        'current_schedule': [
+            {
+                'date': s.date.isoformat(),
+                'day_name': s.date.strftime('%A'),
+                'shift_time': f"{s.start_time} - {s.end_time}",
+                'status': s.status
+            }
+            for s in current_shifts
+        ]
+    }
+
+
+@app.get("/calendar/week-info")
+async def get_week_info(
+    year: int,
+    month: int,
+    week_number: int
+):
+    """Get detailed week information including holidays and required shifts (public endpoint)"""
+    # Calculate week start (Monday of the specified week)
+    jan_1 = date(year, 1, 1)
+    week_start = jan_1 + timedelta(weeks=week_number - 1)
+    # Adjust to Monday
+    days_to_monday = week_start.weekday()
+    week_start = week_start - timedelta(days=days_to_monday)
+    
+    week_info = jp_calendar.get_week_info(week_start)
+    
+    return {
+        'week_start': week_info['week_start'].isoformat(),
+        'week_end': week_info['week_end'].isoformat(),
+        'days': [
+            {
+                'date': day['date'].isoformat(),
+                'day_name': day['day_name'],
+                'is_weekend': day['is_weekend'],
+                'is_holiday': day['is_holiday'],
+                'holiday_name': day['holiday_name'],
+                'is_non_working': day['is_non_working']
+            }
+            for day in week_info['days']
+        ],
+        'weekend_count': week_info['weekend_count'],
+        'holiday_count': week_info['holiday_count'],
+        'weekday_holiday_count': week_info['weekday_holiday_count'],
+        'required_shifts': week_info['required_shifts']
+    }
+
+
 @app.get("/schedules", response_model=List[ScheduleResponse])
 async def get_schedules(
     start_date: date = None,
@@ -4662,6 +5574,13 @@ async def generate_schedules(
         current_date = start_date
         while current_date <= end_date:
             day_name = current_date.strftime('%A')  # e.g., 'Monday', 'Sunday'
+            
+            # ===== SKIP PUBLIC HOLIDAYS - Don't assign shifts on holidays =====
+            if is_japanese_holiday(current_date):
+                holiday_name = get_japanese_holiday_name(current_date)
+                print(f"[DEBUG] Skipping {current_date} ({day_name}) - Public Holiday: {holiday_name}", flush=True)
+                current_date += timedelta(days=1)
+                continue
 
             for shift in shifts:
                 # Check if shift operates on this day
@@ -4950,6 +5869,13 @@ async def generate_schedules(
 
                     if (existing_hours + work_hours <= emp.weekly_hours and
                         existing_hours_today + work_hours <= daily_max):
+                        
+                        # ===== NEW: Check 5-shifts-per-week limit with holiday awareness =====
+                        is_valid_shifts, shifts_error = await validate_5_shifts_per_week(emp.id, current_date, db)
+                        if not is_valid_shifts:
+                            print(f"[DEBUG] ✗ {emp.first_name} failed 5-shifts validation on {current_date}: {shifts_error}", flush=True)
+                            continue  # Skip this employee for this shift due to weekly shift limit
+                        
                         print(f"[DEBUG] ✓ Creating schedule for {emp.first_name} on {current_date}", flush=True)
                         # Create schedule
                         schedule = Schedule(

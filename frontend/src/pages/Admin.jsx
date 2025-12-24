@@ -43,21 +43,25 @@ const AdminDashboardHome = () => {
 
   useEffect(() => {
     loadData();
+    // Auto-refresh dashboard every 30 seconds to show real-time counts
+    const interval = setInterval(loadData, 30000);
+    return () => clearInterval(interval);
   }, []);
 
   const loadData = async () => {
     try {
       setLoading(true);
-      const [usersRes, deptRes] = await Promise.all([
+      const [usersRes, deptRes, empRes] = await Promise.all([
         listUsers(),
-        listDepartments()
+        listDepartments(),
+        listEmployees(false)  // Get only active employees
       ]);
       const users = usersRes.data;
-      const managers = users.filter(u => u.user_type === 'manager');
-      const employees = users.filter(u => u.user_type === 'employee');
+      const managers = users.filter(u => u.user_type === 'manager' && u.is_active === true);
+      const employees = empRes.data;  // Use the filtered list from API
       
       setStats({
-        totalUsers: users.length,
+        totalUsers: users.filter(u => u.is_active === true).length,  // Count only active users
         totalDepartments: deptRes.data.length,
         totalManagers: managers.length,
         totalEmployees: employees.length
@@ -436,6 +440,7 @@ const AdminManagers = () => {
   };
 
   const columns = [
+    { header: 'Manager ID', accessor: 'manager_id', width: '100px' },
     { header: 'Username', accessor: 'username', width: '120px' },
     { header: 'Full Name', accessor: 'full_name', width: '180px' },
     { header: 'Email', accessor: 'email', width: '180px' },
@@ -980,6 +985,7 @@ const AdminDepartments = () => {
     name: '',
     description: ''
   });
+  const [viewMode, setViewMode] = useState('all'); // 'all' = all employees, 'today' = today's attendance
 
   useEffect(() => {
     loadDepartments();
@@ -1005,8 +1011,9 @@ const AdminDepartments = () => {
       const response = await api.get(`/departments/${deptId}/details`);
       setDeptDetails(response.data);
       setSelectedDept(deptId);
+      setViewMode('all'); // Reset to show all employees
       
-      // Load today's attendance for all employees in this department
+      // Load today's attendance for stats
       const today = format(new Date(), 'yyyy-MM-dd');
       const attendanceResponse = await getAttendance(today, today);
       setAttendance(attendanceResponse.data);
@@ -1317,13 +1324,76 @@ const AdminDepartments = () => {
                   </div>
                 </Card>
 
+                {/* Department Stats */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                  <Card padding={false}>
+                    <div className="p-6">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-sm text-gray-500 mb-1">Total Employees</p>
+                          <p className="text-4xl font-bold text-blue-600">{deptDetails.employees?.length || 0}</p>
+                        </div>
+                        <Users className="w-10 h-10 text-blue-500" />
+                      </div>
+                    </div>
+                  </Card>
+                  <Card padding={false}>
+                    <div className="p-6">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-sm text-gray-500 mb-1">Present Today</p>
+                          <p className="text-4xl font-bold text-green-600">{stats.present}</p>
+                        </div>
+                        <CheckCircle className="w-10 h-10 text-green-500" />
+                      </div>
+                    </div>
+                  </Card>
+                  <Card padding={false}>
+                    <div className="p-6">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-sm text-gray-500 mb-1">Attendance Rate</p>
+                          <p className="text-4xl font-bold text-purple-600">
+                            {deptDetails.employees?.length > 0 
+                              ? Math.round((stats.present / deptDetails.employees.length) * 100) 
+                              : 0}%
+                          </p>
+                        </div>
+                        <TrendingUp className="w-10 h-10 text-purple-500" />
+                      </div>
+                    </div>
+                  </Card>
+                </div>
+
                 {/* Employees Table */}
                 <Card>
                   <div className="mb-6">
                     <div className="flex justify-between items-center mb-4">
                       <h3 className="text-xl font-semibold text-gray-900">
-                        Employees ({deptDetails.employees.length})
+                        Employees ({viewMode === 'all' ? deptDetails.employees.length : stats.present})
                       </h3>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => setViewMode('all')}
+                          className={`px-4 py-2 rounded-lg font-medium transition ${
+                            viewMode === 'all'
+                              ? 'bg-blue-500 text-white'
+                              : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                          }`}
+                        >
+                          All Employees
+                        </button>
+                        <button
+                          onClick={() => setViewMode('today')}
+                          className={`px-4 py-2 rounded-lg font-medium transition ${
+                            viewMode === 'today'
+                              ? 'bg-green-500 text-white'
+                              : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                          }`}
+                        >
+                          Today's Attendance
+                        </button>
+                      </div>
                     </div>
 
                     {/* Month Selector and Download Buttons */}
@@ -1432,63 +1502,127 @@ const AdminDepartments = () => {
                       </div>
                     </div>
                   </div>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-                    <Card padding={false}>
-                      <div className="p-6">
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <p className="text-sm text-gray-500 mb-1">Present</p>
-                            <p className="text-3xl font-bold text-green-600">{stats.present}</p>
+                  {/* Toggle Stats for Today's Attendance View */}
+                  {viewMode === 'today' && (
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                      <Card padding={false}>
+                        <div className="p-6">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-sm text-gray-500 mb-1">Present</p>
+                              <p className="text-3xl font-bold text-green-600">{stats.present}</p>
+                            </div>
+                            <CheckCircle className="w-8 h-8 text-green-600" />
                           </div>
-                          <CheckCircle className="w-8 h-8 text-green-600" />
                         </div>
-                      </div>
-                    </Card>
-                    <Card padding={false}>
-                      <div className="p-6">
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <p className="text-sm text-gray-500 mb-1">Late</p>
-                            <p className="text-3xl font-bold text-yellow-600">{stats.late}</p>
+                      </Card>
+                      <Card padding={false}>
+                        <div className="p-6">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-sm text-gray-500 mb-1">Late</p>
+                              <p className="text-3xl font-bold text-yellow-600">{stats.late}</p>
+                            </div>
+                            <AlertCircle className="w-8 h-8 text-yellow-600" />
                           </div>
-                          <AlertCircle className="w-8 h-8 text-yellow-600" />
                         </div>
-                      </div>
-                    </Card>
-                    <Card padding={false}>
-                      <div className="p-6">
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <p className="text-sm text-gray-500 mb-1">Absent</p>
-                            <p className="text-3xl font-bold text-red-600">{stats.absent}</p>
+                      </Card>
+                      <Card padding={false}>
+                        <div className="p-6">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-sm text-gray-500 mb-1">Absent</p>
+                              <p className="text-3xl font-bold text-red-600">{stats.absent}</p>
+                            </div>
+                            <XCircle className="w-8 h-8 text-red-600" />
                           </div>
-                          <XCircle className="w-8 h-8 text-red-600" />
                         </div>
-                      </div>
-                    </Card>
-                  </div>
-
-                  {/* Attendance Table */}
-                  <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-                    <div className="px-6 py-4 border-b border-gray-200">
-                      <h3 className="text-lg font-semibold text-gray-900">
-                        Today's Attendance - {format(new Date(), 'MMMM dd, yyyy')}
-                      </h3>
+                      </Card>
                     </div>
-                    
-                    {attendance.length === 0 ? (
-                      <div className="text-center py-12">
-                        <Clock className="w-16 h-16 mx-auto text-gray-400 mb-4" />
-                        <p className="text-gray-500">No scheduled shifts for today</p>
+                  )}
+
+                  {/* View Mode: All Employees */}
+                  {viewMode === 'all' ? (
+                    <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+                      <div className="px-6 py-4 border-b border-gray-200">
+                        <h3 className="text-lg font-semibold text-gray-900">
+                          All Employees in Department
+                        </h3>
                       </div>
-                    ) : (
-                      <div className="overflow-x-auto">
-                        <table className="min-w-full divide-y divide-gray-200">
-                          <thead className="bg-gray-50">
-                            <tr>
-                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Employee</th>
-                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Role</th>
-                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Assigned Shift</th>
+                      
+                      {deptDetails.employees.length === 0 ? (
+                        <div className="text-center py-12">
+                          <Users className="w-16 h-16 mx-auto text-gray-400 mb-4" />
+                          <p className="text-gray-500">No employees in this department</p>
+                        </div>
+                      ) : (
+                        <div className="overflow-x-auto">
+                          <table className="min-w-full divide-y divide-gray-200">
+                            <thead className="bg-gray-50">
+                              <tr>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Employee ID</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Email</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-200">
+                              {deptDetails.employees.map((emp, idx) => {
+                                // Check if employee has attendance today
+                                const hasAttendanceToday = attendance.some(a => a.employee_id === emp.id);
+                                const attendanceRecord = attendance.find(a => a.employee_id === emp.id);
+                                
+                                return (
+                                  <tr key={emp.id} className={idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">{emp.employee_id}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm">{emp.first_name} {emp.last_name}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm">{emp.email}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                      {hasAttendanceToday ? (
+                                        <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                                          attendanceRecord?.status === 'on-time' || attendanceRecord?.status === 'onTime'
+                                            ? 'bg-green-100 text-green-800'
+                                            : 'bg-yellow-100 text-yellow-800'
+                                        }`}>
+                                          {attendanceRecord?.in_time ? 'Present' : 'Scheduled'}
+                                        </span>
+                                      ) : (
+                                        <span className="px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-800">
+                                          Not Scheduled
+                                        </span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    /* View Mode: Today's Attendance */
+                    <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+                      <div className="px-6 py-4 border-b border-gray-200">
+                        <h3 className="text-lg font-semibold text-gray-900">
+                          Today's Attendance - {format(new Date(), 'MMMM dd, yyyy')}
+                        </h3>
+                      </div>
+                      
+                      {attendance.length === 0 ? (
+                        <div className="text-center py-12">
+                          <Clock className="w-16 h-16 mx-auto text-gray-400 mb-4" />
+                          <p className="text-gray-500">No scheduled shifts for today</p>
+                        </div>
+                      ) : (
+                        <div className="overflow-x-auto">
+                          <table className="min-w-full divide-y divide-gray-200">
+                            <thead className="bg-gray-50">
+                              <tr>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Employee ID</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Employee</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Role</th>
+                                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Assigned Shift</th>
                               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Total Hrs Assigned</th>
                               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Check-In</th>
                               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Check-Out</th>
@@ -1512,6 +1646,9 @@ const AdminDepartments = () => {
 
                               return (
                                 <tr key={record.id} className="hover:bg-gray-50">
+                                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-blue-600">
+                                    {record.employee?.employee_id || '-'}
+                                  </td>
                                   <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
                                     {record.employee?.first_name} {record.employee?.last_name}
                                   </td>
@@ -1556,7 +1693,8 @@ const AdminDepartments = () => {
                         </table>
                       </div>
                     )}
-                  </div>
+                    </div>
+                  )}
                 </Card>
               </>
             )}

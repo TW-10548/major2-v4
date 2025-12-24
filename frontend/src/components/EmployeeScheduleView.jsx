@@ -3,6 +3,7 @@ import { Calendar, Clock, CheckCircle, AlertCircle, RefreshCw } from 'lucide-rea
 import Card from './common/Card';
 import Button from './common/Button';
 import Modal from './common/Modal';
+import ScheduleCalendar from './ScheduleCalendar';
 import { getSchedules, recordAttendance } from '../services/api';
 
 const EmployeeScheduleView = ({ employeeId }) => {
@@ -251,6 +252,18 @@ const EmployeeScheduleView = ({ employeeId }) => {
           </div>
         </div>
       </Card>
+
+      {/* Schedule Calendar with Holidays */}
+      <ScheduleCalendar
+        employeeId={employeeId}
+        onDateSelect={(date) => {
+          setWeekStart(date);
+          const endDate = new Date(date);
+          endDate.setDate(endDate.getDate() + 6);
+          setWeekEnd(endDate.toISOString().split('T')[0]);
+          loadSchedules();
+        }}
+      />
 
       {/* Upcoming Schedules */}
       <div>

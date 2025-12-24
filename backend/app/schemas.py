@@ -152,6 +152,7 @@ class ManagerCreate(BaseModel):
 
 class ManagerResponse(BaseModel):
     id: int
+    manager_id: str
     user_id: int
     department_id: int
     is_active: bool
@@ -162,6 +163,7 @@ class ManagerResponse(BaseModel):
 
 class ManagerDetailResponse(BaseModel):
     id: int
+    manager_id: str
     user_id: int
     username: str
     full_name: str

@@ -69,6 +69,7 @@ class Manager(Base):
     __tablename__ = "managers"
 
     id = Column(Integer, primary_key=True, index=True)
+    manager_id = Column(String(10), unique=True, nullable=False, index=True)  # 3-digit manager ID like "001"
     user_id = Column(Integer, ForeignKey('users.id', name='fk_manager_user'), nullable=False, unique=True, index=True)
     department_id = Column(Integer, ForeignKey('departments.id', name='fk_manager_department'), nullable=False, index=True)
     is_active = Column(Boolean, default=True)

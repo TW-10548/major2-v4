@@ -26,15 +26,52 @@ export default function CheckInOut() {
     return () => clearInterval(timer);
   }, []);
 
+  const formatTime = (dateTime) => {
+    if (!dateTime) return null;
+    try {
+      if (typeof dateTime === 'string') {
+        // Already formatted as string time (HH:MM)
+        if (dateTime.match(/^\d{2}:\d{2}/)) return dateTime;
+        // Parse ISO datetime string
+        const date = new Date(dateTime);
+        return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      }
+      return dateTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    } catch (e) {
+      return null;
+    }
+  };
+
   const loadTodayStatus = async () => {
     try {
       const today = format(new Date(), 'yyyy-MM-dd');
       const response = await getAttendance(today, today);
+      
       if (response.data && response.data.length > 0) {
-        setTodayStatus(response.data[0]);
+        let status = response.data[0];
+        
+        // Normalize the response to always have in_time and out_time
+        // The Attendance API returns in_time/out_time as HH:MM strings
+        if (!status.in_time && status.check_in_time) {
+          status.in_time = formatTime(status.check_in_time);
+        }
+        if (!status.out_time && status.check_out_time) {
+          status.out_time = formatTime(status.check_out_time);
+        }
+        
+        // Normalize status field
+        if (!status.status && status.check_in_status) {
+          status.status = status.check_in_status;
+        }
+        
+        console.log('Loaded status:', status);
+        setTodayStatus(status);
+      } else {
+        setTodayStatus(null);
       }
     } catch (error) {
       console.error('Failed to load attendance status:', error);
+      setTodayStatus(null);
     }
   };
 
@@ -44,12 +81,51 @@ export default function CheckInOut() {
     setSuccess('');
     try {
       const response = await checkIn('Office');
-      setTodayStatus(response.data);
-      setSuccess('✅ Checked in successfully!');
+      
+      // Immediately update UI with check-in response
+      if (response.data || response) {
+        const checkInData = response.data || response;
+        
+        // Create a status object that matches Attendance response format
+        const newStatus = {
+          id: checkInData.id || 0,
+          employee_id: checkInData.employee_id,
+          schedule_id: checkInData.schedule_id,
+          date: checkInData.date,
+          in_time: formatTime(checkInData.check_in_time),
+          out_time: null,
+          status: checkInData.check_in_status,
+          worked_hours: 0,
+          overtime_hours: 0,
+          break_minutes: 0,
+          out_status: null,
+          notes: null
+        };
+        
+        console.log('Check-in successful, setting status:', newStatus);
+        setTodayStatus(newStatus);
+        setSuccess('✅ Checked in successfully!');
+      }
+      
+      // Reload after a moment to ensure database is synced
+      setTimeout(() => {
+        console.log('Reloading status from database...');
+        loadTodayStatus();
+      }, 800);
+      
       setTimeout(() => setSuccess(''), 3000);
     } catch (err) {
-      const errorMsg = err.response?.data?.detail || 'Failed to check in';
+      const errorMsg = err.response?.data?.detail || err.message || 'Failed to check in';
       setError(errorMsg);
+      console.error('Check-in error details:', {
+        status: err.response?.status,
+        message: errorMsg,
+        fullError: err
+      });
+      
+      // Reload status to show correct state when there's an error
+      // This ensures we display the actual current status instead of stale data
+      await loadTodayStatus();
     } finally {
       setLoading(false);
     }
@@ -61,13 +137,44 @@ export default function CheckInOut() {
     setSuccess('');
     try {
       const response = await checkOut(notes);
-      setTodayStatus(response.data);
+      
+      // Immediately update UI with check-out response
+      if (response.data || response) {
+        const checkOutData = response.data || response;
+        
+        // Update the status object with check-out time
+        const updatedStatus = {
+          ...todayStatus,
+          out_time: formatTime(checkOutData.check_out_time),
+          worked_hours: todayStatus.worked_hours || 0,
+          overtime_hours: todayStatus.overtime_hours || 0
+        };
+        
+        console.log('Check-out successful, setting status:', updatedStatus);
+        setTodayStatus(updatedStatus);
+        setSuccess('✅ Checked out successfully!');
+      }
+      
       setNotes('');
-      setSuccess('✅ Checked out successfully!');
+      
+      // Reload after a moment to sync with database
+      setTimeout(() => {
+        console.log('Reloading status from database...');
+        loadTodayStatus();
+      }, 800);
+      
       setTimeout(() => setSuccess(''), 3000);
     } catch (err) {
-      const errorMsg = err.response?.data?.detail || 'Failed to check out';
+      const errorMsg = err.response?.data?.detail || err.message || 'Failed to check out';
       setError(errorMsg);
+      console.error('Check-out error details:', {
+        status: err.response?.status,
+        message: errorMsg,
+        fullError: err
+      });
+      
+      // Reload status to show correct state when there's an error
+      await loadTodayStatus();
     } finally {
       setLoading(false);
     }
@@ -104,6 +211,23 @@ export default function CheckInOut() {
           <span className="text-sm text-green-700">{success}</span>
         </div>
       )}
+
+      {/* DEBUG INFO - Remove in production */}
+      <div className="mb-4 p-2 bg-gray-100 rounded text-xs font-mono overflow-auto max-h-32">
+        <details>
+          <summary className="cursor-pointer font-bold">Debug Info</summary>
+          <div className="mt-2">
+            <p>todayStatus: {todayStatus ? 'EXISTS' : 'NULL'}</p>
+            {todayStatus && (
+              <>
+                <p>in_time: {todayStatus.in_time || 'NULL'}</p>
+                <p>out_time: {todayStatus.out_time || 'NULL'}</p>
+                <p>status: {todayStatus.status}</p>
+              </>
+            )}
+          </div>
+        </details>
+      </div>
 
       <div className="space-y-4">
         {todayStatus ? (
