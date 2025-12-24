@@ -151,6 +151,7 @@ const ManagerEmployees = ({ user }) => {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [showInactive, setShowInactive] = useState(false);
+  const [employmentTypeFilter, setEmploymentTypeFilter] = useState('all');
   const [formData, setFormData] = useState({
     first_name: '',
     last_name: '',
@@ -159,10 +160,12 @@ const ManagerEmployees = ({ user }) => {
     address: '',
     password: '',
     role_id: null,
+    employment_type: 'full_time',
     hire_date: '',
     weekly_hours: 40,
     daily_max_hours: 8,
     shifts_per_week: 5,
+    paid_leave_per_year: 10,
     skills: []
   });
 
@@ -246,10 +249,12 @@ const ManagerEmployees = ({ user }) => {
           address: '',
           password: '',
           role_id: null,
+          employment_type: 'full_time',
           hire_date: '',
           weekly_hours: 40,
           daily_max_hours: 8,
           shifts_per_week: 5,
+          paid_leave_per_year: 10,
           skills: []
         });
         loadData();  // ← Use loadData to respect showInactive filter
@@ -286,10 +291,12 @@ const ManagerEmployees = ({ user }) => {
       address: employee.address || '',
       password: '',
       role_id: employee.role_id || null,
+      employment_type: employee.employment_type || 'full_time',
       hire_date: employee.hire_date || '',
       weekly_hours: employee.weekly_hours || 40,
       daily_max_hours: employee.daily_max_hours || 8,
       shifts_per_week: employee.shifts_per_week || 5,
+      paid_leave_per_year: employee.paid_leave_per_year || 10,
       skills: employee.skills || []
     });
     setShowModal(true);
@@ -372,6 +379,15 @@ const ManagerEmployees = ({ user }) => {
           subtitle={`${employees.length} total employees`}
           headerAction={
             <div className="flex gap-2">
+              <select
+                value={employmentTypeFilter}
+                onChange={(e) => setEmploymentTypeFilter(e.target.value)}
+                className="px-3 py-2 border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:border-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="all">All Types</option>
+                <option value="full_time">Full-Time</option>
+                <option value="part_time">Part-Time</option>
+              </select>
               <label className="flex items-center gap-2 px-3 py-2 border border-gray-300 rounded-lg cursor-pointer hover:bg-gray-50">
                 <input
                   type="checkbox"
@@ -388,7 +404,7 @@ const ManagerEmployees = ({ user }) => {
             </div>
           }
         >
-          <Table columns={columns} data={employees} />
+          <Table columns={columns} data={employees.filter(emp => employmentTypeFilter === 'all' || emp.employment_type === employmentTypeFilter)} />
         </Card>
         <Modal
           isOpen={showModal}
@@ -503,6 +519,22 @@ const ManagerEmployees = ({ user }) => {
               </div>
             </div>
             <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Employment Type</label>
+              <select
+                value={formData.employment_type}
+                onChange={(e) => setFormData({ ...formData, employment_type: e.target.value })}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+              >
+                <option value="full_time">Full-Time (Monthly Cycle: 1-30)</option>
+                <option value="part_time">Part-Time (Cycle: 15th to 15th)</option>
+              </select>
+              <p className="text-xs text-gray-500 mt-1">
+                Full-time: Attendance and leave on monthly cycle (1st - 30th)
+                <br />
+                Part-time: Attendance and leave cycle is 15th of current month to 15th of next month
+              </p>
+            </div>
+            <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Phone</label>
               <input
                 type="tel"
@@ -551,6 +583,17 @@ const ManagerEmployees = ({ user }) => {
                 onChange={(e) => setFormData({ ...formData, shifts_per_week: parseInt(e.target.value) })}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
               />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Annual Paid Leave Days</label>
+              <input
+                type="number"
+                min="0"
+                value={formData.paid_leave_per_year}
+                onChange={(e) => setFormData({ ...formData, paid_leave_per_year: parseInt(e.target.value) })}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+              />
+              <p className="text-xs text-gray-500 mt-1">Total paid leave days employee can use per year (carries over to next year)</p>
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Skills (comma-separated)</label>

@@ -986,6 +986,7 @@ const AdminDepartments = () => {
     description: ''
   });
   const [viewMode, setViewMode] = useState('all'); // 'all' = all employees, 'today' = today's attendance
+  const [employmentTypeFilter, setEmploymentTypeFilter] = useState('all'); // 'all', 'full_time', 'part_time'
 
   useEffect(() => {
     loadDepartments();
@@ -1393,6 +1394,15 @@ const AdminDepartments = () => {
                         >
                           Today's Attendance
                         </button>
+                        <select
+                          value={employmentTypeFilter}
+                          onChange={(e) => setEmploymentTypeFilter(e.target.value)}
+                          className="px-4 py-2 rounded-lg border border-gray-300 text-gray-700 font-medium hover:border-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                          <option value="all">All Types</option>
+                          <option value="full_time">Full-Time</option>
+                          <option value="part_time">Part-Time</option>
+                        </select>
                       </div>
                     </div>
 
@@ -1567,7 +1577,13 @@ const AdminDepartments = () => {
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-gray-200">
-                              {deptDetails.employees.map((emp, idx) => {
+                              {deptDetails.employees
+                                .filter(emp => {
+                                  // Filter by employment type
+                                  if (employmentTypeFilter === 'all') return true;
+                                  return emp.employment_type === employmentTypeFilter;
+                                })
+                                .map((emp, idx) => {
                                 // Check if employee has attendance today
                                 const hasAttendanceToday = attendance.some(a => a.employee_id === emp.id);
                                 const attendanceRecord = attendance.find(a => a.employee_id === emp.id);

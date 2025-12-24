@@ -1,7 +1,7 @@
 # Admin Department Stats - Visual Guide
 
 ## Feature Location
-ssss
+
 In the Admin Dashboard → Department Management section, when you select a department:
 
 ```

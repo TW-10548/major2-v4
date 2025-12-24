@@ -119,6 +119,7 @@ async def seed_unified_data():
                 await session.flush()
                 
                 manager = Manager(
+                    manager_id=f"M{i+1:03d}",  # M001, M002, M003, M004, M005
                     user_id=user.id,
                     department_id=departments[i].id,
                     is_active=True

@@ -184,6 +184,7 @@ class EmployeeBase(BaseModel):
     address: Optional[str] = None
     department_id: int
     role_id: Optional[int] = None
+    employment_type: str = 'full_time'  # 'full_time' or 'part_time'
     weekly_hours: float = 40
     daily_max_hours: float = 8
     shifts_per_week: int = 5
@@ -207,6 +208,7 @@ class EmployeeResponse(BaseModel):
     department_id: int
     role_id: Optional[int]
     user_id: Optional[int]
+    employment_type: str
     weekly_hours: float
     daily_max_hours: float
     shifts_per_week: int

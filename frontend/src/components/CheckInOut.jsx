@@ -7,11 +7,12 @@ import Button from './common/Button';
 
 export default function CheckInOut() {
   const [todayStatus, setTodayStatus] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [notes, setNotes] = useState('');
   const [currentTime, setCurrentTime] = useState(new Date());
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   useEffect(() => {
     loadTodayStatus();
@@ -45,10 +46,14 @@ export default function CheckInOut() {
   const loadTodayStatus = async () => {
     try {
       const today = format(new Date(), 'yyyy-MM-dd');
+      console.log(`[CheckInOut] Loading status for ${today}`);
       const response = await getAttendance(today, today);
+      
+      console.log('[CheckInOut] API Response:', response);
       
       if (response.data && response.data.length > 0) {
         let status = response.data[0];
+        console.log('[CheckInOut] Status found:', status);
         
         // Normalize the response to always have in_time and out_time
         // The Attendance API returns in_time/out_time as HH:MM strings
@@ -64,15 +69,27 @@ export default function CheckInOut() {
           status.status = status.check_in_status;
         }
         
-        console.log('Loaded status:', status);
+        console.log('Normalized status:', status);
         setTodayStatus(status);
+        setError('');
       } else {
+        console.log('[CheckInOut] No status found for today');
         setTodayStatus(null);
+        setError('');
       }
     } catch (error) {
       console.error('Failed to load attendance status:', error);
+      setError('Failed to load check-in status');
       setTodayStatus(null);
+    } finally {
+      setLoading(false);
     }
+  };
+
+  const handleRefresh = async () => {
+    setIsRefreshing(true);
+    await loadTodayStatus();
+    setIsRefreshing(false);
   };
 
   const handleCheckIn = async () => {
@@ -198,6 +215,13 @@ export default function CheckInOut() {
         </div>
       </div>
 
+      {loading && (
+        <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg flex items-start">
+          <div className="w-4 h-4 bg-blue-500 rounded-full animate-pulse mr-2 flex-shrink-0 mt-0.5" />
+          <span className="text-sm text-blue-700">Loading check-in status...</span>
+        </div>
+      )}
+
       {error && (
         <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-start">
           <AlertCircle className="w-5 h-5 text-red-500 mr-2 flex-shrink-0 mt-0.5" />
@@ -225,6 +249,13 @@ export default function CheckInOut() {
                 <p>status: {todayStatus.status}</p>
               </>
             )}
+            <button
+              onClick={handleRefresh}
+              disabled={isRefreshing}
+              className="mt-2 px-2 py-1 bg-blue-500 text-white rounded text-xs hover:bg-blue-600 disabled:bg-gray-400"
+            >
+              {isRefreshing ? 'Refreshing...' : 'Refresh Status'}
+            </button>
           </div>
         </details>
       </div>

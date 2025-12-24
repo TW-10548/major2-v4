@@ -96,6 +96,7 @@ class Employee(Base):
     department_id = Column(Integer, ForeignKey('departments.id', name='fk_emp_department'), nullable=False)
     role_id = Column(Integer, ForeignKey('roles.id', name='fk_emp_role'), nullable=True)
     user_id = Column(Integer, ForeignKey('users.id', name='fk_emp_user'), nullable=True)
+    employment_type = Column(String(20), default='full_time')  # 'full_time' or 'part_time'
     weekly_hours = Column(Float, default=40)
     daily_max_hours = Column(Float, default=8)
     shifts_per_week = Column(Integer, default=5)

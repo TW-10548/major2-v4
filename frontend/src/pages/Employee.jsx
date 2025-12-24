@@ -33,6 +33,7 @@ const EmployeeDashboardHome = ({ user }) => {
   const navigate = useNavigate();
   const [todaySchedule, setTodaySchedule] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [leaveStats, setLeaveStats] = useState(null);
 
   useEffect(() => {
     loadData();
@@ -41,10 +42,12 @@ const EmployeeDashboardHome = ({ user }) => {
   const loadData = async () => {
     try {
       const today = format(new Date(), 'yyyy-MM-dd');
-      const [schedulesRes] = await Promise.all([
-        getSchedules(today, today)
+      const [schedulesRes, statsRes] = await Promise.all([
+        getSchedules(today, today),
+        getLeaveStatistics()
       ]);
       setTodaySchedule(schedulesRes.data[0] || null);
+      setLeaveStats(statsRes.data);
     } catch (error) {
       console.error('Failed to load dashboard data:', error);
     } finally {
@@ -64,6 +67,32 @@ const EmployeeDashboardHome = ({ user }) => {
     <div>
       <Header title="Employee Dashboard" subtitle={`Welcome back, ${user.full_name}`} />
       <div className="p-6">
+        {/* Paid Leave Notification */}
+        {leaveStats && leaveStats.taken_paid_leave <= 1 && (
+          <div className="mb-6">
+            {leaveStats.taken_paid_leave <= 0 ? (
+              <div className="p-4 bg-blue-50 border border-blue-200 rounded-lg flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <p className="font-semibold text-blue-900">Paid Leave Available</p>
+                  <p className="text-sm text-blue-700 mt-1">
+                    You have not taken any paid leave yet. You have <strong>{leaveStats.available_paid_leave}</strong> paid leave days remaining. You can use that for your rest days.
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <p className="font-semibold text-amber-900">Paid Leave Status</p>
+                  <p className="text-sm text-amber-700 mt-1">
+                    You have taken <strong>1 day</strong> of paid leave only. You have <strong>{leaveStats.available_paid_leave}</strong> days left to use.
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
           <Card title={`Today's Schedule - ${format(new Date(), 'MMM dd, yyyy')}`}>
             {todaySchedule ? (

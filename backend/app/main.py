@@ -54,6 +54,254 @@ app.add_middleware(
 )
 
 
+# =============== DATABASE UPGRADE FUNCTION ===============
+
+async def upgrade_database():
+    """Run database migrations for comp-off tracking enhancement"""
+    from app.database import engine
+    from sqlalchemy import text
+    
+    try:
+        async with engine.begin() as conn:
+            # Check if columns already exist
+            try:
+                result = await conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'comp_off_tracking' AND column_name = 'earned_date'
+                """))
+                if result.scalar():
+                    print("✓ comp_off_tracking already has earned_date column")
+                    return
+            except Exception as e:
+                print(f"Note: {e}")
+
+            try:
+                # Add new columns to comp_off_tracking
+                print("Adding new columns to comp_off_tracking...")
+                await conn.execute(text("""
+                    ALTER TABLE comp_off_tracking
+                    ADD COLUMN IF NOT EXISTS earned_date TIMESTAMP,
+                    ADD COLUMN IF NOT EXISTS expired_days INTEGER DEFAULT 0
+                """))
+                print("✓ Added earned_date and expired_days columns to comp_off_tracking")
+                await conn.commit()
+            except Exception as e:
+                print(f"Error adding columns: {e}")
+                await conn.rollback()
+
+            try:
+                # Create comp_off_details table
+                print("Creating comp_off_details table...")
+                await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS comp_off_details (
+                        id SERIAL PRIMARY KEY,
+                        employee_id INTEGER NOT NULL,
+                        tracking_id INTEGER NOT NULL,
+                        type VARCHAR(50) DEFAULT 'earned',
+                        date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        earned_month VARCHAR(7),
+                        expired_at TIMESTAMP,
+                        notes VARCHAR(255),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        CONSTRAINT fk_compoff_detail_employee FOREIGN KEY (employee_id) 
+                            REFERENCES employees(id) ON DELETE CASCADE,
+                        CONSTRAINT fk_compoff_detail_tracking FOREIGN KEY (tracking_id) 
+                            REFERENCES comp_off_tracking(id) ON DELETE CASCADE
+                    )
+                """))
+                print("✓ Created comp_off_details table")
+                await conn.commit()
+            except Exception as e:
+                print(f"Error creating table: {e}")
+                await conn.rollback()
+
+            # Create indexes for performance
+            try:
+                print("Creating indexes...")
+                await conn.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_compoff_details_employee 
+                    ON comp_off_details(employee_id)
+                """))
+                await conn.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_compoff_details_earned_month 
+                    ON comp_off_details(earned_month)
+                """))
+                await conn.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_compoff_details_type 
+                    ON comp_off_details(type)
+                """))
+                print("✓ Created indexes for comp_off_details")
+                await conn.commit()
+            except Exception as e:
+                print(f"Note: {e}")
+
+            print("✓ Database migration completed successfully!")
+    except Exception as e:
+        print(f"Database upgrade error: {e}")
+
+
+async def add_manager_id_column():
+    """Migration to add manager_id field to Manager table"""
+    from app.database import engine
+    from sqlalchemy import text
+    
+    try:
+        async with engine.begin() as conn:
+            # Check if column already exists
+            result = await conn.execute(
+                text("SELECT column_name FROM information_schema.columns WHERE table_name='managers' AND column_name='manager_id'")
+            )
+            if result.scalar():
+                print("✓ manager_id column already exists")
+                return
+            
+            print("Adding manager_id column to managers table...")
+            
+            # Add the column
+            await conn.execute(
+                text("ALTER TABLE managers ADD COLUMN manager_id VARCHAR(10) UNIQUE")
+            )
+            await conn.commit()
+            print("✓ Column added successfully")
+            
+            # Get all managers and assign manager_ids
+            print("Populating manager_id values...")
+            result = await conn.execute(text("SELECT id FROM managers ORDER BY id"))
+            managers = result.fetchall()
+            
+            for manager in managers:
+                manager_id_str = f"{manager[0]:03d}"  # Format as 3-digit: 001, 002, 003
+                await conn.execute(
+                    text(f"UPDATE managers SET manager_id = '{manager_id_str}' WHERE id = {manager[0]}")
+                )
+                print(f"  Manager {manager[0]} -> {manager_id_str}")
+            
+            await conn.commit()
+            print(f"✓ Created manager_ids for {len(managers)} managers")
+            
+    except Exception as e:
+        print(f"Manager ID migration error: {e}")
+
+
+async def add_employee_id_column():
+    """Migration to add employee_id column to employees table"""
+    from app.database import engine
+    from sqlalchemy import text
+    
+    try:
+        async with engine.begin() as conn:
+            # Check if column already exists
+            result = await conn.execute(
+                text("""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name='employees' AND column_name='employee_id'
+                """)
+            )
+            
+            if result.fetchone():
+                print("✓ Column employee_id already exists")
+            else:
+                print("Adding employee_id column...")
+                await conn.execute(
+                    text("""
+                        ALTER TABLE employees 
+                        ADD COLUMN employee_id VARCHAR(10)
+                    """)
+                )
+                print("✓ Column employee_id added")
+                
+                # Update existing employees with auto-generated IDs
+                print("Generating employee IDs...")
+                await conn.execute(
+                    text("""
+                        UPDATE employees 
+                        SET employee_id = LPAD(id::text, 5, '0')
+                        WHERE employee_id IS NULL
+                    """)
+                )
+                print("✓ Employee IDs generated")
+                
+                # Make it unique and not null
+                print("Adding constraints...")
+                await conn.execute(
+                    text("""
+                        ALTER TABLE employees 
+                        ALTER COLUMN employee_id SET NOT NULL
+                    """)
+                )
+                await conn.execute(
+                    text("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_employee_id 
+                        ON employees(employee_id)
+                    """)
+                )
+                print("✓ Constraints added")
+                await conn.commit()
+            
+    except Exception as e:
+        print(f"Employee ID migration error: {e}")
+
+
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Run all database migrations on startup"""
+    print("\n" + "="*60)
+    print("Running database migrations on startup...")
+    print("="*60)
+    
+    # Run migrations in order
+    await add_employee_id_column()
+    await add_manager_id_column()
+    await upgrade_database()
+    
+    print("="*60)
+    print("All migrations completed!")
+    print("="*60 + "\n")
+
+
+# =============== HELPER FUNCTIONS ===============
+
+def get_cycle_dates(employment_type: str, reference_date: date = None):
+    """
+    Get the start and end dates of the current cycle based on employment type.
+    
+    Full-time: Calendar month (1st to last day)
+    Part-time: 15th of current month to 15th of next month
+    """
+    if reference_date is None:
+        reference_date = date.today()
+    
+    if employment_type == 'part_time':
+        # Part-time cycle: 15th to 15th
+        if reference_date.day < 15:
+            # Before 15th, cycle started on 15th of previous month
+            first_day = reference_date.replace(day=1)
+            last_month = first_day - timedelta(days=1)
+            cycle_start = last_month.replace(day=15)
+        else:
+            # On or after 15th, cycle started on 15th of current month
+            cycle_start = reference_date.replace(day=15)
+        
+        # End date is 15th of next month
+        if reference_date.month == 12:
+            cycle_end = date(reference_date.year + 1, 1, 15)
+        else:
+            cycle_end = reference_date.replace(month=reference_date.month + 1, day=15)
+        
+        return cycle_start, cycle_end
+    else:
+        # Full-time: Calendar month
+        first_day = reference_date.replace(day=1)
+        if reference_date.month == 12:
+            last_day = date(reference_date.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            last_day = reference_date.replace(month=reference_date.month + 1, day=1) - timedelta(days=1)
+        
+        return first_day, last_day
+
+
 # Custom exception handler for HTTPException to include CORS headers
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -1371,16 +1619,22 @@ async def check_in(
                     break_minutes=0
                 )
                 db.add(attendance)
+                await db.flush()
+                print(f"[CHECK-IN] Created attendance record for employee {employee.id}")
             else:
                 # Update existing record with check-in time if not already set
                 if not attendance.in_time:
                     attendance.in_time = now.strftime("%H:%M") if now else None
                     attendance.status = status_val
+                    await db.flush()
+                    print(f"[CHECK-IN] Updated attendance record for employee {employee.id}")
             
             await db.commit()
-            print(f"[CHECK-IN] Attendance record created/updated for employee {employee.id}")
         except Exception as att_error:
-            print(f"[CHECK-IN WARNING] Failed to create attendance record: {str(att_error)}")
+            await db.rollback()
+            print(f"[CHECK-IN ERROR] Failed to create/update attendance record: {str(att_error)}")
+            import traceback
+            traceback.print_exc()
             # Don't fail the check-in if attendance record fails
         
         # Refresh with proper eager loading
@@ -1735,19 +1989,26 @@ async def get_todays_attendance(
         )
     )
     schedules = sched_result.scalars().all()
+    schedule_map = {s.employee_id: s for s in schedules}
 
-    # Get today's check-ins
+    # Get today's check-ins for this department's employees
+    employee_ids = [e.id for e in employees]
     checkin_result = await db.execute(
         select(CheckInOut).filter(
-            CheckInOut.date == today
+            CheckInOut.date == today,
+            CheckInOut.employee_id.in_(employee_ids)
         )
     )
     checkins = {c.employee_id: c for c in checkin_result.scalars().all()}
 
-    # Build attendance summary
+    # Build attendance summary - include all employees with schedules + all checked-in employees
     attendance_summary = []
+    included_employees = set()
+    
+    # First, add all employees with schedules
     for schedule in schedules:
         checkin = checkins.get(schedule.employee_id)
+        employee = next((e for e in employees if e.id == schedule.employee_id), None)
 
         status = "absent"
         if checkin:
@@ -1760,17 +2021,44 @@ async def get_todays_attendance(
 
         attendance_summary.append({
             "employee_id": schedule.employee_id,
+            "employee_name": f"{employee.first_name} {employee.last_name}" if employee else "Unknown",
             "schedule_id": schedule.id,
             "scheduled_time": f"{schedule.start_time} - {schedule.end_time}",
             "check_in_time": checkin.check_in_time.isoformat() if checkin and checkin.check_in_time else None,
             "check_out_time": checkin.check_out_time.isoformat() if checkin and checkin.check_out_time else None,
             "status": status
         })
+        included_employees.add(schedule.employee_id)
+    
+    # Then, add any checked-in employees who don't have a schedule
+    for employee_id, checkin in checkins.items():
+        if employee_id not in included_employees:
+            employee = next((e for e in employees if e.id == employee_id), None)
+            
+            status = "absent"
+            if checkin:
+                if checkin.check_out_time:
+                    status = "completed"
+                elif checkin.check_in_status == "on-time":
+                    status = "present"
+                else:
+                    status = checkin.check_in_status
+            
+            attendance_summary.append({
+                "employee_id": employee_id,
+                "employee_name": f"{employee.first_name} {employee.last_name}" if employee else "Unknown",
+                "schedule_id": None,
+                "scheduled_time": "No Schedule",
+                "check_in_time": checkin.check_in_time.isoformat() if checkin and checkin.check_in_time else None,
+                "check_out_time": checkin.check_out_time.isoformat() if checkin and checkin.check_out_time else None,
+                "status": status
+            })
 
     return {
         "date": today.isoformat(),
         "total_scheduled": len(schedules),
         "total_checked_in": len(checkins),
+        "total_shown": len(attendance_summary),
         "attendance": attendance_summary
     }
 
@@ -2987,12 +3275,43 @@ async def export_employee_monthly_attendance(
         
         row += 1
         leave_items = [
-            ('Paid Leave Days', f'{paid_leave_days:.1f}'),
+            ('Annual Paid Leave Entitlement', f'{employee.paid_leave_per_year}'),
+            ('Paid Leave Days Used', f'{paid_leave_days:.1f}'),
+            ('Paid Leave Days Remaining', f'{max(0, employee.paid_leave_per_year - paid_leave_days):.1f}'),
             ('Unpaid Leave Days', f'{unpaid_leave_days:.1f}'),
             ('Total Leave Days', f'{paid_leave_days + unpaid_leave_days:.1f}'),
         ]
         
         for label, value in leave_items:
+            summary_sheet[f'A{row}'] = label
+            summary_sheet[f'B{row}'] = value
+            summary_sheet[f'A{row}'].font = summary_font
+            summary_sheet[f'A{row}'].fill = summary_fill
+            summary_sheet[f'A{row}'].border = border
+            summary_sheet[f'B{row}'].border = border
+            summary_sheet[f'B{row}'].alignment = Alignment(horizontal='right')
+            row += 1
+        
+        # COMP-OFF SUMMARY
+        row += 1
+        comp_off_earned = len(comp_off_earned_dates)
+        comp_off_used = len(comp_off_used_dates)
+        summary_sheet[f'A{row}'] = "COMP-OFF SUMMARY"
+        summary_sheet[f'A{row}'].font = section_font
+        summary_sheet[f'A{row}'].fill = summary_fill
+        summary_sheet[f'A{row}'].border = border
+        summary_sheet[f'B{row}'].fill = summary_fill
+        summary_sheet[f'B{row}'].border = border
+        summary_sheet.merge_cells(f'A{row}:B{row}')
+        
+        row += 1
+        compoff_items = [
+            ('Comp-Off Earned Days', f'{comp_off_earned}'),
+            ('Comp-Off Used Days', f'{comp_off_used}'),
+            ('Comp-Off Balance', f'{comp_off_earned - comp_off_used}'),
+        ]
+        
+        for label, value in compoff_items:
             summary_sheet[f'A{row}'] = label
             summary_sheet[f'B{row}'] = value
             summary_sheet[f'A{row}'].font = summary_font
@@ -3180,6 +3499,28 @@ async def create_leave_request(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
     
+    # Check for overlapping leave requests (approved or pending)
+    # A leave request overlaps if any existing leave request has dates that intersect
+    overlap_result = await db.execute(
+        select(LeaveRequest).filter(
+            LeaveRequest.employee_id == leave_data.employee_id,
+            LeaveRequest.status.in_([LeaveStatus.APPROVED, LeaveStatus.PENDING]),
+            # Overlapping condition: existing.start <= new.end AND existing.end >= new.start
+            LeaveRequest.start_date <= leave_data.end_date,
+            LeaveRequest.end_date >= leave_data.start_date
+        )
+    )
+    overlapping_leaves = overlap_result.scalars().all()
+    
+    if overlapping_leaves:
+        conflict_dates = []
+        for leave in overlapping_leaves:
+            conflict_dates.append(f"{leave.start_date} to {leave.end_date} ({leave.leave_type}, {leave.status})")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot add leave request. Overlapping with existing leave: {'; '.join(conflict_dates)}"
+        )
+    
     # If requesting paid leave, check if it exceeds the annual entitlement
     if leave_data.leave_type == 'paid':
         # Calculate days for this request
@@ -3301,19 +3642,29 @@ async def get_leave_statistics(
         if not employee:
             raise HTTPException(status_code=404, detail="Employee not found")
         
-        # Get all leave requests for this employee
+        # Get cycle dates based on employment type
+        cycle_start, cycle_end = get_cycle_dates(employee.employment_type)
+        
+        # Get all leave requests for this employee within the current cycle
         result = await db.execute(
             select(LeaveRequest)
-            .filter(LeaveRequest.employee_id == employee.id, LeaveRequest.status == LeaveStatus.APPROVED)
+            .filter(
+                LeaveRequest.employee_id == employee.id,
+                LeaveRequest.status == LeaveStatus.APPROVED,
+                LeaveRequest.start_date <= cycle_end,
+                LeaveRequest.end_date >= cycle_start
+            )
         )
         approved_leaves = result.scalars().all()
         
-        # Calculate taken paid leaves
-        from datetime import date
+        # Calculate taken paid leaves within current cycle
         taken_paid = 0
         for leave in approved_leaves:
             if leave.leave_type == 'paid':
-                days = (leave.end_date - leave.start_date).days + 1
+                # Only count leaves that overlap with the current cycle
+                leave_start = max(leave.start_date, cycle_start)
+                leave_end = min(leave.end_date, cycle_end)
+                days = (leave_end - leave_start).days + 1
                 # Handle half-day leaves
                 if leave.duration_type and leave.duration_type.startswith('half_day'):
                     days = 0.5
@@ -3336,7 +3687,10 @@ async def get_leave_statistics(
             "taken_paid_leave": taken_paid,
             "available_paid_leave": available_paid,
             "comp_off_available": comp_off_available,
-            "employee_name": f"{employee.first_name} {employee.last_name}"
+            "employee_name": f"{employee.first_name} {employee.last_name}",
+            "employment_type": employee.employment_type,
+            "cycle_start": cycle_start.isoformat(),
+            "cycle_end": cycle_end.isoformat()
         }
     else:
         raise HTTPException(status_code=403, detail="Only employees can access their statistics")
@@ -5412,22 +5766,28 @@ async def generate_schedules(
             if schedules_to_delete_ids:
                 print(f"[DEBUG] Deleting {len(schedules_to_delete_ids)} work shift and comp-off usage schedules", flush=True)
                 
-                # Delete Attendance records first (has FK to schedules)
-                await db.execute(
-                    delete(Attendance)
-                    .where(Attendance.schedule_id.in_(schedules_to_delete_ids))
-                )
+                # IMPORTANT: Do NOT delete Attendance records - they are historical data
+                # Only nullify the schedule_id reference since we're regenerating schedules
+                # The attendance data (check-in times, worked hours) should be preserved
                 
-                # Nullify in CheckInOut table
+                # Nullify in CheckInOut table (schedule reference, but keep the check-in record)
                 await db.execute(
                     update(CheckInOut)
                     .where(CheckInOut.schedule_id.in_(schedules_to_delete_ids))
                     .values(schedule_id=None)
                 )
-                # Nullify in CompOffRequest table
+                
+                # Nullify in CompOffRequest table (preserve comp-off requests)
                 await db.execute(
                     update(CompOffRequest)
                     .where(CompOffRequest.schedule_id.in_(schedules_to_delete_ids))
+                    .values(schedule_id=None)
+                )
+                
+                # Nullify in Attendance table (preserve attendance records but remove schedule reference)
+                await db.execute(
+                    update(Attendance)
+                    .where(Attendance.schedule_id.in_(schedules_to_delete_ids))
                     .values(schedule_id=None)
                 )
             
